@@ -25,6 +25,7 @@
 !/port/src/
 !/port/tools/
 !/port/third_party/
+!/port/android/
 
 /tools/*
 !/tools/*.cmd
