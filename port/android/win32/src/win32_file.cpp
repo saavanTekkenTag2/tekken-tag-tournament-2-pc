@@ -32,13 +32,17 @@ using namespace w32;
 // ======================================================================================
 extern "C" const char* Ttt2AndroidDataRoot(void)
 {
-    static std::string root = [] {
-        const char* r = std::getenv("TTT2_ROOT");
-        std::string s = (r && *r) ? r : "/data/local/tmp/ttt2";
-        while (s.size() > 1 && s.back() == '/') s.pop_back();
-        return s;
-    }();
-    return root.c_str();
+    // Read on every call: the Android entry sets TTT2_ROOT after the library is loaded. Returned
+    // pointers stay valid (one stored copy per distinct value).
+    static std::mutex m;
+    static std::vector<std::string*>* seen = new std::vector<std::string*>();
+    const char* r = std::getenv("TTT2_ROOT");
+    std::string s = (r && *r) ? r : "/data/local/tmp/ttt2";
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    std::lock_guard lk(m);
+    for (std::string* p : *seen) if (*p == s) return p->c_str();
+    seen->push_back(new std::string(s));
+    return seen->back()->c_str();
 }
 
 namespace w32 {
@@ -137,22 +141,16 @@ DWORD AttrsOf(const struct stat& st, const std::string& name)
     if (base[0] == '.' && base[1] && !(base[1] == '.' && !base[2])) a |= FILE_ATTRIBUTE_HIDDEN;
     return a ? a : FILE_ATTRIBUTE_NORMAL;
 }
-// Windows' %LOCALAPPDATA% and friends: point them at the data root once.
+// Windows' %LOCALAPPDATA% and friends: the data root, unless already set (the Android entry sets them).
 void EnsureEnv()
 {
-    static bool done = [] {
-        const std::string root = Ttt2AndroidDataRoot();
-        if (!std::getenv("LOCALAPPDATA")) setenv("LOCALAPPDATA", root.c_str(), 0);
-        if (!std::getenv("APPDATA")) setenv("APPDATA", root.c_str(), 0);
-        if (!std::getenv("USERPROFILE")) setenv("USERPROFILE", root.c_str(), 0);
-        if (!std::getenv("TEMP")) setenv("TEMP", (root + "/tmp").c_str(), 0);
-        if (!std::getenv("TMP")) setenv("TMP", (root + "/tmp").c_str(), 0);
-        mkdir((root + "/tmp").c_str(), 0700);
-        return true;
-    }();
-    (void)done;
+    const std::string root = Ttt2AndroidDataRoot();
+    setenv("LOCALAPPDATA", root.c_str(), 0);
+    setenv("APPDATA", root.c_str(), 0);
+    setenv("USERPROFILE", root.c_str(), 0);
+    setenv("TEMP", (root + "/tmp").c_str(), 0);
+    setenv("TMP", (root + "/tmp").c_str(), 0);
 }
-struct EnvInit { EnvInit() { EnsureEnv(); } } g_envInit;
 
 HANDLE OpenHost(const std::string& path, DWORD access, DWORD disposition, DWORD flags)
 {

@@ -1703,6 +1703,46 @@ struct Sha256
         for (int i = 0; i < 8; ++i) { out[i * 4] = uint8_t(h[i] >> 24); out[i * 4 + 1] = uint8_t(h[i] >> 16); out[i * 4 + 2] = uint8_t(h[i] >> 8); out[i * 4 + 3] = uint8_t(h[i]); }
     }
 };
+struct Sha1
+{
+    uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
+    uint8_t buf[64]; size_t len = 0; uint64_t bits = 0;
+    static uint32_t L(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+    void Block(const uint8_t* p)
+    {
+        uint32_t w[80];
+        for (int i = 0; i < 16; ++i) w[i] = uint32_t(p[i * 4]) << 24 | uint32_t(p[i * 4 + 1]) << 16 | uint32_t(p[i * 4 + 2]) << 8 | p[i * 4 + 3];
+        for (int i = 16; i < 80; ++i) w[i] = L(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; ++i)
+        {
+            uint32_t f, k;
+            if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+            const uint32_t t = L(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = L(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    void Update(const uint8_t* p, size_t n)
+    {
+        bits += uint64_t(n) * 8;
+        while (n--) { buf[len++] = *p++; if (len == 64) { Block(buf); len = 0; } }
+    }
+    void Final(uint8_t out[20])
+    {
+        const uint64_t b = bits;
+        uint8_t one = 0x80; Update(&one, 1);
+        uint8_t zero = 0; while (len != 56) Update(&zero, 1);
+        for (int i = 0; i < 8; ++i) buf[len++] = uint8_t(b >> (56 - 8 * i));
+        Block(buf); len = 0;
+        for (int i = 0; i < 5; ++i) { out[i * 4] = uint8_t(h[i] >> 24); out[i * 4 + 1] = uint8_t(h[i] >> 16); out[i * 4 + 2] = uint8_t(h[i] >> 8); out[i * 4 + 3] = uint8_t(h[i]); }
+    }
+};
+// A BCrypt hash object: SHA-1 or SHA-256
+struct HashObj { bool sha1; Sha1 a; Sha256 b; };
 } // namespace
 extern "C" void Ttt2Sha256(const void* data, size_t size, uint8_t out[32]) { Sha256 s; s.Update(static_cast<const uint8_t*>(data), size); s.Final(out); }
 
@@ -1710,26 +1750,47 @@ extern "C" NTSTATUS BCryptOpenAlgorithmProvider(BCRYPT_ALG_HANDLE* alg, LPCWSTR 
 {
     if (!alg || !id) return NTSTATUS(0xC000000D);
     if (wcscasecmp(id, L"SHA256") == 0) { *alg = BCRYPT_SHA256_ALG_HANDLE; return 0; }
+    if (wcscasecmp(id, L"SHA1") == 0) { *alg = BCRYPT_SHA1_ALG_HANDLE; return 0; }
     if (wcscasecmp(id, L"RNG") == 0) { *alg = reinterpret_cast<BCRYPT_ALG_HANDLE>(uintptr_t(0x81)); return 0; }
     return NTSTATUS(0xC00000BB);
 }
 extern "C" NTSTATUS BCryptCloseAlgorithmProvider(BCRYPT_ALG_HANDLE, ULONG) { return 0; }
-extern "C" NTSTATUS BCryptGetProperty(BCRYPT_HANDLE, LPCWSTR prop, PUCHAR out, ULONG size, ULONG* result, ULONG)
+extern "C" NTSTATUS BCryptGetProperty(BCRYPT_HANDLE obj, LPCWSTR prop, PUCHAR out, ULONG size, ULONG* result, ULONG)
 {
     DWORD v = 0;
-    if (wcscasecmp(prop, L"ObjectLength") == 0) v = sizeof(Sha256);
-    else if (wcscasecmp(prop, L"HashDigestLength") == 0) v = 32;
+    if (wcscasecmp(prop, L"ObjectLength") == 0) v = sizeof(HashObj);
+    else if (wcscasecmp(prop, L"HashDigestLength") == 0) v = obj == BCRYPT_SHA1_ALG_HANDLE ? 20 : 32;
     else return NTSTATUS(0xC00000BB);
     if (result) *result = sizeof(DWORD);
     if (out && size >= sizeof(DWORD)) std::memcpy(out, &v, sizeof(v));
     return 0;
 }
-extern "C" NTSTATUS BCryptCreateHash(BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE* hash, PUCHAR, ULONG, PUCHAR, ULONG, ULONG) { *hash = new Sha256(); return 0; }
-extern "C" NTSTATUS BCryptHashData(BCRYPT_HASH_HANDLE hash, PUCHAR input, ULONG size, ULONG) { static_cast<Sha256*>(hash)->Update(input, size); return 0; }
-extern "C" NTSTATUS BCryptFinishHash(BCRYPT_HASH_HANDLE hash, PUCHAR out, ULONG size, ULONG) { if (size < 32) return NTSTATUS(0xC000000D); static_cast<Sha256*>(hash)->Final(out); return 0; }
-extern "C" NTSTATUS BCryptDestroyHash(BCRYPT_HASH_HANDLE hash) { delete static_cast<Sha256*>(hash); return 0; }
-extern "C" NTSTATUS BCryptHash(BCRYPT_ALG_HANDLE, PUCHAR, ULONG, PUCHAR input, ULONG inputSize, PUCHAR out, ULONG outSize)
+extern "C" NTSTATUS BCryptCreateHash(BCRYPT_ALG_HANDLE alg, BCRYPT_HASH_HANDLE* hash, PUCHAR, ULONG, PUCHAR, ULONG, ULONG)
 {
+    auto* h = new HashObj(); h->sha1 = alg == BCRYPT_SHA1_ALG_HANDLE; *hash = h; return 0;
+}
+extern "C" NTSTATUS BCryptHashData(BCRYPT_HASH_HANDLE hash, PUCHAR input, ULONG size, ULONG)
+{
+    auto* h = static_cast<HashObj*>(hash);
+    if (h->sha1) h->a.Update(input, size); else h->b.Update(input, size);
+    return 0;
+}
+extern "C" NTSTATUS BCryptFinishHash(BCRYPT_HASH_HANDLE hash, PUCHAR out, ULONG size, ULONG)
+{
+    auto* h = static_cast<HashObj*>(hash);
+    if (size < (h->sha1 ? 20u : 32u)) return NTSTATUS(0xC000000D);
+    if (h->sha1) h->a.Final(out); else h->b.Final(out);
+    return 0;
+}
+extern "C" NTSTATUS BCryptDestroyHash(BCRYPT_HASH_HANDLE hash) { delete static_cast<HashObj*>(hash); return 0; }
+extern "C" NTSTATUS BCryptHash(BCRYPT_ALG_HANDLE alg, PUCHAR, ULONG, PUCHAR input, ULONG inputSize, PUCHAR out, ULONG outSize)
+{
+    if (alg == BCRYPT_SHA1_ALG_HANDLE)
+    {
+        if (outSize < 20) return NTSTATUS(0xC000000D);
+        Sha1 s; s.Update(input, inputSize); s.Final(out);
+        return 0;
+    }
     if (outSize < 32) return NTSTATUS(0xC000000D);
     Ttt2Sha256(input, inputSize, out);
     return 0;

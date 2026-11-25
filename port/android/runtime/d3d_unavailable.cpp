@@ -1,6 +1,6 @@
-// Stage 3 only (no DXVK yet): the D3D11 / DXGI / D3DCompiler entry points the renderer imports.
+// Builds without DXVK (TTT2_D3D_LIBS empty): the D3D11 / DXGI entry points the renderer imports.
 // Every call fails cleanly, so libmain.so links and the platform layer can be tested. Stage 4
-// replaces this file with DXVK-native (d3d11, dxgi) and vkd3d-shader's D3DCompile.
+// DXVK-native (libdxvk_d3d11.so, libdxvk_dxgi.so) provides the real ones.
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -19,12 +19,5 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(IDXGIAdapter*, D3D_DRIVER_TYPE, HMOD
     if (context) *context = nullptr;
     if (level) *level = D3D_FEATURE_LEVEL_11_0;
     std::fprintf(stderr, "[d3d] D3D11CreateDevice: no DXVK in this build (stage 3)\n");
-    return E_NOTIMPL;
-}
-extern "C" HRESULT WINAPI D3DCompile(const void*, SIZE_T, const char*, const D3D_SHADER_MACRO*, ID3DInclude*, const char*,
-                                     const char*, UINT, UINT, ID3DBlob** shader, ID3DBlob** errors)
-{
-    if (shader) *shader = nullptr;
-    if (errors) *errors = nullptr;
     return E_NOTIMPL;
 }

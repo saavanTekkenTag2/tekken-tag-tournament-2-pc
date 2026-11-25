@@ -106,6 +106,7 @@ void Apply(const Region* r, size_t first, size_t last)
 } // namespace
 
 using namespace w32;
+extern "C" void Ttt2InstallSignalHandlers(void);
 
 extern "C" LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect)
 {
@@ -204,6 +205,7 @@ extern "C" BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD type)
 
 extern "C" BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWORD oldProtect)
 {
+    Ttt2InstallSignalHandlers();
     const uintptr_t a = reinterpret_cast<uintptr_t>(address);
     const uintptr_t start = a & ~(kPage - 1);
     const uintptr_t end = (a + size + kPage - 1) & ~(kPage - 1);
@@ -272,8 +274,10 @@ extern "C" BOOL FlushInstructionCache(HANDLE, LPCVOID address, SIZE_T size)
     return TRUE;
 }
 
+extern "C" void Ttt2InstallSignalHandlers(void);
 extern "C" UINT ResetWriteWatch(LPVOID base, SIZE_T size)
 {
+    Ttt2InstallSignalHandlers();   // the write faults need the handler
     const uintptr_t a = reinterpret_cast<uintptr_t>(base);
     std::unique_lock lk(g_regionsMutex);
     Region* r = Find(a);

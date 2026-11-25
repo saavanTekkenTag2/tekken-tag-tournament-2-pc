@@ -8,6 +8,8 @@
 //   game/tekken.img, game/data*.bin, ...   (built by the installer from the player's disc + TU3)
 //   TTT2Recomp/log.txt                     (the game's log; saves and settings next to it)
 #include <SDL.h>
+#include <jni.h>
+#include <cstdint>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,14 @@
 int ttt2_main(int argc, char** argv);                       // main.cpp
 extern "C" void Ttt2InstallSignalHandlers(void);            // win32_memory.cpp
 extern "C" void Ttt2SetCommandLine(int argc, char** argv);  // win32_core.cpp
+
+extern "C" void Ttt2SetTouchPad(uint32_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry, uint32_t lt, uint32_t rt);   // win32_sdl.cpp
+
+// The launcher's on-screen controls (com.saavan.ttt2.TouchOverlay): XInput buttons, sticks, triggers.
+extern "C" JNIEXPORT void JNICALL Java_com_saavan_ttt2_Native_setTouchPad(JNIEnv*, jclass, jint buttons, jint lx, jint ly, jint rx, jint ry, jint lt, jint rt)
+{
+    Ttt2SetTouchPad(uint32_t(buttons), lx, ly, rx, ry, uint32_t(lt), uint32_t(rt));
+}
 
 static void MakeDirs(const std::string& path)
 {
@@ -58,6 +68,11 @@ extern "C" int SDL_main(int argc, char* argv[])
     setDefault("TTT2_GPU_HW", "1");                        // the hardware renderer (D3D11 -> DXVK -> Vulkan)
     setDefault("TTT2_FBDUMP", "0");
     setDefault("TTT2_SAVE_ROOT", root + "/TTT2Recomp/saves");
+    // DXVK (D3D11 -> Vulkan): its log and pipeline state cache next to the game's log
+    setDefault("DXVK_LOG_PATH", root + "/TTT2Recomp");
+    setDefault("DXVK_LOG_LEVEL", "info");
+    setDefault("DXVK_STATE_CACHE_PATH", root + "/TTT2Recomp");
+    setDefault("DXVK_HUD", "0");
 
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_INFO, "TTT2", "root %s; game log: %s/TTT2Recomp/log.txt", root.c_str(), root.c_str());
