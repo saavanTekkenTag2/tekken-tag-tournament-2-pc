@@ -84,7 +84,7 @@ public class LauncherActivity extends Activity {
     private MenuItem playItem, isoItem, tuItem;
     private final List<MenuItem> menuItems = new ArrayList<>();
     private View installPanel;
-    private TextView installText;
+    private TextView installText, installTitle;
     private ProgressBar installBar;
     private volatile boolean cancel;
     private boolean installing, entered;
@@ -104,11 +104,22 @@ public class LauncherActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("ttt2", MODE_PRIVATE);
+        useFullScreen(this);
         try { bold = getResources().getFont(R.font.oswald_bold); semi = getResources().getFont(R.font.oswald_semibold); regular = getResources().getFont(R.font.oswald_regular); }
         catch (Exception e) { bold = Typeface.DEFAULT_BOLD; semi = Typeface.DEFAULT_BOLD; regular = Typeface.DEFAULT; }
         setContentView(buildRoot());
         hideSystemBars();
         refresh();
+    }
+
+    /** r23: draw under the camera cut-out too (it left a black band down one side in landscape). Option: "full_screen". */
+    static void useFullScreen(Activity a) {
+        if (!a.getSharedPreferences("ttt2", MODE_PRIVATE).getBoolean("full_screen", true)) return;
+        WindowManager.LayoutParams lp = a.getWindow().getAttributes();
+        lp.layoutInDisplayCutoutMode = android.os.Build.VERSION.SDK_INT >= 30
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        a.getWindow().setAttributes(lp);
     }
 
     private boolean noAnim() { return Settings.animationsOff(this); }
@@ -230,7 +241,10 @@ public class LauncherActivity extends Activity {
 
         bg = new ImageView(this);
         bg.setImageResource(R.drawable.home_bg);
-        bg.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        // r23: filled edge to edge and anchored at the top (the logo is there): CENTER_CROP cut the logo off on wide
+        // phones. The motion's zoom pivots on the top edge.
+        bg.setScaleType(ImageView.ScaleType.MATRIX);
+        bg.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> fitBackground());
         root.addView(bg, flp(-1, -1, Gravity.FILL));
 
         // Static scrims (no live blur): darker left half for the menu, darker bottom edge for the footer.
@@ -258,6 +272,14 @@ public class LauncherActivity extends Activity {
 
         pages = new FrameLayout(this);
         root.addView(pages, flp(-1, -1, Gravity.FILL));
+        // The art goes under the camera cut-out; the menus keep clear of it.
+        root.setOnApplyWindowInsetsListener((v, in) -> {
+            android.view.DisplayCutout c = in.getDisplayCutout();
+            int l = c != null ? c.getSafeInsetLeft() : 0, r = c != null ? c.getSafeInsetRight() : 0;
+            pages.setPadding(l, 0, r, 0);
+            if (installPanel != null) installPanel.setPadding(l, 0, r, 0);
+            return in;
+        });
         home = buildHome();
         pages.addView(home, flp(-1, -1, Gravity.FILL));
         current = home;
@@ -266,6 +288,22 @@ public class LauncherActivity extends Activity {
         installPanel.setVisibility(View.GONE);
         root.addView(installPanel, flp(-1, -1, Gravity.FILL));
         return root;
+    }
+
+    private static final float BG_ZOOM = 1.035f;
+
+    private void fitBackground() {
+        android.graphics.drawable.Drawable d = bg.getDrawable();
+        int vw = bg.getWidth(), vh = bg.getHeight();
+        if (d == null || vw == 0 || vh == 0) return;
+        float iw = d.getIntrinsicWidth(), ih = d.getIntrinsicHeight();
+        float scale = Math.max(vw / iw, vh / ih);
+        android.graphics.Matrix m = new android.graphics.Matrix();
+        m.setScale(scale, scale);
+        m.postTranslate((vw - iw * scale) / 2f, 0);
+        bg.setImageMatrix(m);
+        bg.setPivotX(vw / 2f);
+        bg.setPivotY(0);
     }
 
     private static int withAlpha(int c, int a) { return Color.argb(a, Color.red(c), Color.green(c), Color.blue(c)); }
@@ -347,14 +385,14 @@ public class LauncherActivity extends Activity {
     private void enter() {
         View corner = (View) home.getTag();
         if (noAnim()) {
-            bg.setAlpha(1f); bg.setScaleX(1.06f); bg.setScaleY(1.06f);
+            bg.setAlpha(1f); bg.setScaleX(BG_ZOOM); bg.setScaleY(BG_ZOOM);
             for (MenuItem m : menuItems) { m.setAlpha(1f); m.setTranslationX(0); }
             corner.setAlpha(1f);
             playItem.requestFocus();
             return;
         }
-        bg.setAlpha(0f); bg.setScaleX(1.14f); bg.setScaleY(1.14f);
-        bg.animate().alpha(1f).scaleX(1.06f).scaleY(1.06f).setDuration(400).setInterpolator(new DecelerateInterpolator()).start();
+        bg.setAlpha(0f); bg.setScaleX(1.10f); bg.setScaleY(1.10f);
+        bg.animate().alpha(1f).scaleX(BG_ZOOM).scaleY(BG_ZOOM).setDuration(400).setInterpolator(new DecelerateInterpolator()).start();
         for (int i = 0; i < menuItems.size(); i++) {
             MenuItem m = menuItems.get(i);
             m.setAlpha(0f);
@@ -369,15 +407,18 @@ public class LauncherActivity extends Activity {
     /** Background motion: a slow drift of the art and light streaks crossing now and then. */
     private void startLoops() {
         stopLoops();
-        if (noAnim()) { bg.setScaleX(1.06f); bg.setScaleY(1.06f); return; }
-        ObjectAnimator drift = ObjectAnimator.ofFloat(bg, View.TRANSLATION_X, -dp(14), dp(14));
+        if (noAnim()) { bg.setScaleX(BG_ZOOM); bg.setScaleY(BG_ZOOM); bg.setTranslationX(0); bg.setTranslationY(0); return; }
+        // Drift within the zoom's margin (1.75% each side), so no edge ever shows.
+        float mx = Math.max(1f, root.getWidth() * (BG_ZOOM - 1f) / 2f * 0.9f);
+        ObjectAnimator drift = ObjectAnimator.ofFloat(bg, View.TRANSLATION_X, -mx, mx);
         drift.setDuration(18000);
         drift.setRepeatCount(ValueAnimator.INFINITE);
         drift.setRepeatMode(ValueAnimator.REVERSE);
         drift.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
         drift.start();
         loops.add(drift);
-        ObjectAnimator driftY = ObjectAnimator.ofFloat(bg, View.TRANSLATION_Y, dp(6), -dp(6));
+        float my = Math.max(1f, root.getHeight() * (BG_ZOOM - 1f) * 0.8f);
+        ObjectAnimator driftY = ObjectAnimator.ofFloat(bg, View.TRANSLATION_Y, 0, -my);
         driftY.setDuration(23000);
         driftY.setRepeatCount(ValueAnimator.INFINITE);
         driftY.setRepeatMode(ValueAnimator.REVERSE);
@@ -583,6 +624,9 @@ public class LauncherActivity extends Activity {
             list.addView(note("For smooth play: Resolution 540p or 720p, Async pipelines ON, Async shaders ON, Big cores ON. "
                 + "The first match on each stage builds its shaders once; later starts load them."));
         for (Settings.Opt o : Settings.ALL) if (o.group.equals(optionsGroup)) list.addView(optionRow(o, ini), llp(-1, -2, 6));
+        if (optionsGroup.equals("CONTROLS"))
+            list.addView(actionRow("EDIT LAYOUT", "Move each part of the touch pad and set its own size and opacity.",
+                () -> startActivity(new Intent(this, ControlsEditorActivity.class))), llp(-1, -2, 6));
         if (optionsGroup.equals("DEBUG")) {
             list.addView(actionRow("CUSTOM VARIABLES", "Any other runtime switch, one NAME=VALUE per line (advanced).", this::editCustom), llp(-1, -2, 6));
         }
@@ -675,6 +719,9 @@ public class LauncherActivity extends Activity {
     private void fillTools(LinearLayout list) {
         list.addView(note("Game folder, saves and logs: " + dataRoot(this) + "\nSaves: TTT2Recomp/saves   Log: TTT2Recomp/log.txt"));
         list.addView(actionRow(installed() ? "REINSTALL GAME" : "INSTALL GAME", "Builds the game folder again from the chosen ISO and Title Update.", this::startInstall), llp(-1, -2, 6));
+        list.addView(actionRow(shadersBuilt(this) ? "BUILD SHADERS (DONE - CHECK FOR NEW)" : "BUILD SHADERS",
+            "Prepares every graphics shader now (one time, 10-40 minutes) so matches start without missing stages or characters.", this::startShaderBuild), llp(-1, -2, 6));
+        list.addView(actionRow("EDIT TOUCH CONTROLS", "Move, resize and fade each on-screen button.", () -> startActivity(new Intent(this, ControlsEditorActivity.class))), llp(-1, -2, 6));
         list.addView(actionRow("LOGS", "The crash report, the start of the log, important lines and the end.", this::showLog), llp(-1, -2, 6));
         list.addView(actionRow("FRAMES", "The frames saved by DEBUG -> SAVE FRAMES.", this::showFrames), llp(-1, -2, 6));
         list.addView(actionRow("EXPORT DEBUG", "Logs, frames and failed shaders as Download/ttt2-debug-<time>.zip, to attach to a report.", this::exportDebug), llp(-1, -2, 6));
@@ -701,12 +748,12 @@ public class LauncherActivity extends Activity {
     private void clearShaderCache() {
         File root = new File(dataRoot(this));
         int n = 0;
-        for (File d : new File[] { new File(root, "TTT2Recomp"), new File(root, "TTT2Recomp/shadercache"), new File(root, "ttt2/port/shadercache-debug") }) {
+        for (File d : new File[] { new File(root, "TTT2Recomp"), new File(root, "TTT2Recomp/shadercache"), new File(root, "TTT2Recomp/shadercache/ucode"), new File(root, "ttt2/port/shadercache-debug") }) {
             File[] files = d.listFiles();
             if (files == null) continue;
             for (File f : files) {
                 String s = f.getName();
-                if (f.isFile() && (s.endsWith(".dxbc") || s.endsWith(".dxvk-cache") || s.endsWith(".bin")) && f.delete()) n++;
+                if (f.isFile() && (s.endsWith(".dxbc") || s.endsWith(".dxvk-cache") || s.endsWith(".bin") || s.equals("prebuilt.txt")) && f.delete()) n++;
             }
         }
         toastStatus("Shader cache cleared (" + n + " files).");
@@ -718,6 +765,7 @@ public class LauncherActivity extends Activity {
     }
 
     // ================================================================ CREDITS
+    /** r23: Catonix's profile card (photo, name, what the port is, the links, three buttons), then the work it is built on. */
     private View buildCredits() {
         ScrollView sv = new ScrollView(this);
         LinearLayout col = new LinearLayout(this);
@@ -725,70 +773,70 @@ public class LauncherActivity extends Activity {
         col.setPadding(dp(4), dp(4), dp(4), dp(24));
         sv.addView(col);
 
-        // Port author.
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(22), dp(20), dp(22), dp(20));
+        card.setBackground(card(225));
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setPadding(dp(16), dp(14), dp(16), dp(14));
-        top.setBackground(panel(185));
-        LinearLayout me = new LinearLayout(this);
-        me.setOrientation(LinearLayout.VERTICAL);
-        TextView by = text("ANDROID PORT BY", 10, RED, semi);
-        by.setLetterSpacing(0.25f);
-        me.addView(by);
-        me.addView(text(Credits.PORT_BY, 24, Color.WHITE, bold));
-        TextView gh = link(Credits.GITHUB, "https://" + Credits.GITHUB);
-        me.addView(gh);
-        top.addView(me, new LinearLayout.LayoutParams(0, -2, 1f));
-        col.addView(top);
-
-        // Catonix with the profile photo.
-        LinearLayout cat = new LinearLayout(this);
-        cat.setOrientation(LinearLayout.HORIZONTAL);
-        cat.setGravity(Gravity.CENTER_VERTICAL);
-        cat.setPadding(dp(16), dp(14), dp(16), dp(14));
-        cat.setBackground(panel(185));
-        cat.addView(catonixPhoto(), new LinearLayout.LayoutParams(dp(74), dp(74)));
-        LinearLayout cc = new LinearLayout(this);
-        cc.setOrientation(LinearLayout.VERTICAL);
-        cc.setPadding(dp(16), 0, 0, 0);
-        TextView sp = text("SPECIAL THANKS", 10, RED, semi);
-        sp.setLetterSpacing(0.25f);
-        cc.addView(sp);
-        cc.addView(text(Credits.CATONIX, 22, Color.WHITE, bold));
-        LinearLayout links = new LinearLayout(this);
-        links.setOrientation(LinearLayout.HORIZONTAL);
-        for (String[] l : Credits.CATONIX_LINKS) {
-            TextView b = text(l[0], 11.5f, Color.WHITE, semi);
-            b.setLetterSpacing(0.12f);
-            b.setPadding(dp(16), dp(6), dp(14), dp(6));
-            b.setBackground(new Plate(dp(8), Color.argb(190, 150, 12, 24), Color.rgb(255, 90, 90)));
-            b.setFocusable(true);
-            b.setOnClickListener(v -> open(l[1]));
-            tapFeedback(b);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
-            lp.rightMargin = dp(8);
-            lp.topMargin = dp(6);
-            links.addView(b, lp);
+        top.addView(catonixPhoto(), new LinearLayout.LayoutParams(dp(96), dp(96)));
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.VERTICAL);
+        info.setPadding(dp(22), 0, 0, 0);
+        TextView name = text(Credits.PORT_BY, 34, Color.WHITE, bold);
+        name.setLetterSpacing(0.04f);
+        info.addView(name);
+        info.addView(text(Credits.SUBTITLE, 14, SILVER, regular), llp(-2, -2, 6));
+        for (String[] l : Credits.LINKS) {
+            LinearLayout line = new LinearLayout(this);
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            line.addView(text(l[0] + "  ", 12.5f, STEEL, regular));
+            TextView url = text(l[1], 12.5f, SILVER, regular);
+            url.setFocusable(true);
+            url.setOnClickListener(v -> open(l[1]));
+            line.addView(url);
+            if (!l[2].isEmpty()) line.addView(text("  " + l[2], 12.5f, STEEL, regular));
+            info.addView(line, llp(-2, -2, 5));
         }
-        cc.addView(links);
-        cat.addView(cc, new LinearLayout.LayoutParams(0, -2, 1f));
-        col.addView(cat, llp(-1, -2, 8));
+        top.addView(info, new LinearLayout.LayoutParams(0, -2, 1f));
+        card.addView(top);
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < Credits.BUTTONS.length; i++) {
+            final String[] b = Credits.BUTTONS[i];
+            TextView btn = text(b[0], 14, Color.WHITE, semi);
+            btn.setGravity(Gravity.CENTER);
+            btn.setPadding(dp(8), dp(11), dp(8), dp(11));
+            GradientDrawable g = new GradientDrawable();
+            g.setColor(Color.rgb(214, 24, 44));
+            g.setCornerRadius(dp(10));
+            btn.setBackground(g);
+            btn.setFocusable(true);
+            btn.setOnClickListener(v -> open(b[1]));
+            tapFeedback(btn);
+            LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, -2, 1f);
+            if (i > 0) bp.leftMargin = dp(10);
+            buttons.addView(btn, bp);
+        }
+        card.addView(buttons, llp(-1, -2, 18));
+        col.addView(card);
 
-        // Everyone else.
         LinearLayout list = new LinearLayout(this);
         list.setOrientation(LinearLayout.VERTICAL);
-        list.setPadding(dp(16), dp(12), dp(16), dp(12));
-        list.setBackground(panel(175));
+        list.setPadding(dp(22), dp(16), dp(22), dp(16));
+        list.setBackground(card(200));
+        TextView built = text("BUILT WITH", 11, RED, semi);
+        built.setLetterSpacing(0.25f);
+        list.addView(built);
         for (String[] t : Credits.THANKS) {
-            TextView h = text(t[0].toUpperCase(java.util.Locale.ROOT), 12.5f, SILVER, semi);
-            h.setLetterSpacing(0.08f);
-            list.addView(h, llp(-1, -2, list.getChildCount() == 0 ? 0 : 10));
+            TextView h = text(t[0], 13.5f, SILVER, semi);
+            list.addView(h, llp(-1, -2, 10));
             TextView d = text(t[1], 11.5f, STEEL, regular);
             d.setPadding(0, dp(2), 0, 0);
             list.addView(d);
         }
-        col.addView(list, llp(-1, -2, 8));
+        col.addView(list, llp(-1, -2, 12));
 
         TextView disc = text(Credits.DISCLAIMER, 10.5f, STEEL, regular);
         disc.setLineSpacing(0, 1.15f);
@@ -800,13 +848,22 @@ public class LauncherActivity extends Activity {
                 View v = col.getChildAt(i);
                 v.setAlpha(0f);
                 v.setTranslationY(dp(18));
-                v.animate().alpha(1f).translationY(0).setStartDelay(160 + i * 70L).setDuration(300).setInterpolator(new DecelerateInterpolator()).start();
+                v.animate().alpha(1f).translationY(0).setStartDelay(160 + i * 80L).setDuration(300).setInterpolator(new DecelerateInterpolator()).start();
             }
         }
         return page("CREDITS", sv);
     }
 
-    /** Catonix's profile photo (res/drawable-nodpi/catonix.jpg/.png when present), round; else a round badge. */
+    /** The credits' cards: near-black, rounded, a thin light border. */
+    private GradientDrawable card(int alpha) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.argb(alpha, 8, 6, 10));
+        g.setStroke(dp(1), Color.argb(70, 220, 224, 235));
+        g.setCornerRadius(dp(18));
+        return g;
+    }
+
+    /** Catonix's profile photo (res/drawable-nodpi/catonix.png), round with a light ring. */
     private View catonixPhoto() {
         int id = getResources().getIdentifier("catonix", "drawable", getPackageName());
         View v;
@@ -816,7 +873,7 @@ public class LauncherActivity extends Activity {
             iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
             v = iv;
         } else {
-            TextView t = text("C", 34, Color.WHITE, bold);
+            TextView t = text("C", 40, Color.WHITE, bold);
             t.setGravity(Gravity.CENTER);
             GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[] { RED, RED_DARK });
             g.setShape(GradientDrawable.OVAL);
@@ -834,7 +891,7 @@ public class LauncherActivity extends Activity {
     private GradientDrawable ring() {
         GradientDrawable g = new GradientDrawable();
         g.setShape(GradientDrawable.OVAL);
-        g.setStroke(dp(2), RED);
+        g.setStroke(dp(3), Color.rgb(236, 236, 240));
         return g;
     }
 
@@ -858,7 +915,7 @@ public class LauncherActivity extends Activity {
         String iso = prefs.getString("iso", null), tu = prefs.getString("tu", null);
         isoItem.setSub(iso == null ? "NOT CHOSEN" : nameOf(iso, ""));
         tuItem.setSub(tu == null ? "NOT CHOSEN" : nameOf(tu, ""));
-        playItem.setSub(installing ? "INSTALLING..." : ok ? "READY" : iso != null && tu != null ? "TAP TO INSTALL" : "SELECT ISO AND TITLE UPDATE FIRST");
+        playItem.setSub(installing ? "PLEASE WAIT..." : ok ? (shadersBuilt(this) ? "READY" : "READY - SHADERS NOT BUILT YET (OPTIONS > TOOLS)") : iso != null && tu != null ? "TAP TO INSTALL" : "SELECT ISO AND TITLE UPDATE FIRST");
         playItem.setAlpha(installing ? 0.5f : 1f);
         isoItem.setEnabled(!installing);
         tuItem.setEnabled(!installing);
@@ -910,9 +967,9 @@ public class LauncherActivity extends Activity {
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(26), dp(20), dp(26), dp(18));
         card.setBackground(panel(235));
-        TextView t = text("INSTALLING", 22, Color.WHITE, bold);
-        t.setLetterSpacing(0.12f);
-        card.addView(t);
+        installTitle = text("INSTALLING", 22, Color.WHITE, bold);
+        installTitle.setLetterSpacing(0.12f);
+        card.addView(installTitle);
         installText = text("", 12, STEEL, regular);
         card.addView(installText, llp(-1, -2, 8));
         installBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
@@ -957,6 +1014,7 @@ public class LauncherActivity extends Activity {
         cancel = false;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (current != home) goHome();
+        installTitle.setText("INSTALLING");
         installText.setText("Starting...");
         installBar.setProgress(0);
         showInstallPanel(true);
@@ -982,12 +1040,63 @@ public class LauncherActivity extends Activity {
                 showInstallPanel(false);
                 status.setText(err == null ? "Installed. Press PLAY." : "Install failed: " + err);
                 refresh();
+                if (err == null) startShaderBuild();
             });
         }, "ttt2-install").start();
     }
 
+    // ================================================================ shaders (r23)
+    static boolean shadersBuilt(Context c) {
+        return new File(dataRoot(c), "TTT2Recomp/shadercache/prebuilt.txt").isFile();
+    }
+
+    /** Every game shader compiled ahead of time (Native.buildShaders): the match's first start no longer builds them while it runs. */
+    private void startShaderBuild() {
+        if (installing) return;
+        if (!installed()) { toastStatus("Install the game first."); return; }
+        installing = true;
+        cancel = false;
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (current != home) goHome();
+        installTitle.setText("BUILDING SHADERS");
+        installText.setText("Finding the game's shaders... (one time, 10-40 minutes; keep the app open)");
+        installBar.setProgress(0);
+        showInstallPanel(true);
+        refresh();
+        new Thread(() -> {
+            String error;
+            try {
+                error = Native.buildShaders(dataRoot(this), new Native.Listener() {
+                    @Override public void progress(int percent, String text) {
+                        runOnUiThread(() -> { installBar.setProgress(percent); installText.setText(text + "\nOne time only. Keep the app open - it continues where it stopped."); });
+                    }
+                    @Override public boolean cancelled() { return cancel; }
+                });
+            } catch (Throwable t) {
+                error = t.toString();
+            }
+            final String err = error;
+            runOnUiThread(() -> {
+                installing = false;
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                showInstallPanel(false);
+                status.setText(err == null ? "Shaders built. Press PLAY." : err);
+                refresh();
+            });
+        }, "ttt2-shaders").start();
+    }
+
     private void play() {
         if (installing) return;
+        if (installed() && !shadersBuilt(this) && !prefs.getBoolean("skip_shader_prompt", false)) {
+            new AlertDialog.Builder(this).setTitle("Build shaders first?")
+                .setMessage("Recommended once: every graphics shader is prepared now (10-40 minutes), so matches start with the stage and "
+                    + "characters ready instead of building them while you play.")
+                .setPositiveButton("Build now", (d, w) -> startShaderBuild())
+                .setNegativeButton("Play anyway", (d, w) -> { prefs.edit().putBoolean("skip_shader_prompt", true).apply(); play(); })
+                .show();
+            return;
+        }
         if (!installed()) {
             if (prefs.getString("iso", null) != null && prefs.getString("tu", null) != null) startInstall();
             else toastStatus("Select your ISO and Title Update first.");

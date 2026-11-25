@@ -107,6 +107,8 @@ final class Settings {
         ALL.add(env(P, "Async shaders", "New game shaders compile in the background instead of stopping the game.", "TTT2_SHADER_ASYNC", "1", ONOFF_V, ONOFF_L));
         ALL.add(env(P, "Shader build threads", "How many shaders compile at once (on the slow cores). AUTO picks by the phone.", "TTT2_SHADER_THREADS", "",
             new String[] { "", "1", "2", "3", "4" }, new String[] { "AUTO", "1", "2", "3", "4" }));
+        ALL.add(env(P, "Vulkan pipeline threads", "Threads DXVK uses to build pipelines. Fewer = smoother menus, more = shorter first loads.", "TTT2_DXVK_THREADS", "2",
+            new String[] { "1", "2", "3", "4", "6" }, new String[] { "1", "2", "3", "4", "6" }));
         ALL.add(env(P, "Shader warm-up", "Loads every shader built before at start: longer loading, fewer stutters.", "TTT2_SHADER_WARM", "1", ONOFF_V, ONOFF_L));
         ALL.add(env(P, "Big cores", "Keeps the game on the phone's fast cores and the background work on the slow ones.", "TTT2_BIG_CORES", "1", ONOFF_V, ONOFF_L));
         ALL.add(env(P, "GPU vertex shaders", "Characters' vertices on the GPU (OFF: the CPU, much slower; for testing).", "TTT2_GPU_VS", "1", ONOFF_V, ONOFF_L));
@@ -131,6 +133,7 @@ final class Settings {
         // ---------------- CONTROLS
         String C = "CONTROLS";
         ALL.add(pref(C, "On-screen controls", "The touch pad over the game.", "touch", "1", ONOFF_V, ONOFF_L));
+        ALL.add(pref(C, "Full screen", "Uses the whole screen, also beside the camera hole.", "full_screen", "1", ONOFF_V, ONOFF_L));
         ALL.add(pref(C, "Controls opacity", "How see-through the touch pad is.", "touch_alpha", "100",
             new String[] { "30", "45", "60", "75", "90", "100" }, new String[] { "30%", "45%", "60%", "75%", "90%", "100%" }));
         ALL.add(pref(C, "Controls size", "The size of the touch pad.", "touch_size", "100",

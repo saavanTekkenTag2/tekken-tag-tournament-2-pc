@@ -15,6 +15,9 @@ public final class Native {
     /** Builds the game folder under root from the disc image and Title Update 3. Null = success, else the error. */
     public static native String install(String isoPath, String titleUpdatePath, String root, Listener listener);
 
+    /** r23: every game shader compiled into the cache ahead of time. Null = done, else the error / "stopped". */
+    public static native String buildShaders(String root, Listener listener);
+
     /** On-screen controls: XInput button bits, sticks -32768..32767, triggers 0..255. */
     public static native void setTouchPad(int buttons, int lx, int ly, int rx, int ry, int lt, int rt);
 

@@ -30,6 +30,13 @@
             </intent-filter>
         </activity>
 
+        <!-- r23: touch controls layout editor -->
+        <activity
+            android:name=".ControlsEditorActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+
         <!-- The game (SDL2): its own process, so it always starts fresh -->
         <activity
             android:name=".GameActivity"

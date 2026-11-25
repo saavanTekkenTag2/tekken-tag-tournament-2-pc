@@ -1647,6 +1647,24 @@ int GpuPrebuildShaders(const std::vector<std::filesystem::path>& files, unsigned
     return 3;
 #endif
 }
+// r23: the same, with progress / cancel (the Android launcher's BUILD SHADERS, android_install.cpp).
+int GpuPrebuildShadersProgress(const std::vector<std::filesystem::path>& files, unsigned threads,
+                               bool (*progress)(void* user, size_t done, size_t total), void* user)
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    ttt2_hw::Backend::PrebuildProgress() = progress;
+    ttt2_hw::Backend::PrebuildUser() = user;
+    int rc;
+    try { rc = ttt2_hw::Backend::PrebuildShaders(files, threads); }
+    catch (const std::exception& e) { std::fprintf(stderr, "[shaders] stopped: %s\n", e.what()); rc = 5; }
+    ttt2_hw::Backend::PrebuildProgress() = nullptr;
+    ttt2_hw::Backend::PrebuildUser() = nullptr;
+    return rc;
+#else
+    (void)files; (void)threads; (void)progress; (void)user;
+    return 3;
+#endif
+}
 // main.cpp --translate vs|ps <file>: the HLSL for one microcode file (host-order dwords).
 int GpuTranslateFile(const char* kind, const char* path)
 {

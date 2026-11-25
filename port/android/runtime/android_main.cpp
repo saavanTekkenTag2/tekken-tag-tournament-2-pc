@@ -225,6 +225,20 @@ extern "C" int SDL_main(int argc, char* argv[])
     setDefault("DXVK_STATE_CACHE_PATH", root + "/TTT2Recomp");
     setDefault("DXVK_HUD", "0");
     setDefault("DXVK_ASYNC", "1");                         // r22: pipelines built in the background (dxvk-async)
+    // r23: DXVK's pipeline threads. It took 5 + 5 on an 8-core phone (log of r22): at boot they rebuilt the 708 cached
+    // pipelines on every core while the main menu ran. TTT2_DXVK_THREADS (launcher option, default 2) each.
+    if (!std::getenv("DXVK_CONFIG_FILE"))
+    {
+        const char* t = std::getenv("TTT2_DXVK_THREADS");
+        const int n = t && std::atoi(t) > 0 ? std::atoi(t) : 2;
+        const std::string conf = root + "/TTT2Recomp/dxvk.conf";
+        if (FILE* f = std::fopen(conf.c_str(), "w"))
+        {
+            std::fprintf(f, "# written by the game at every start (android_main.cpp)\ndxvk.numCompilerThreads = %d\ndxvk.numAsyncThreads = %d\n", n, n);
+            std::fclose(f);
+            setenv("DXVK_CONFIG_FILE", conf.c_str(), 1);
+        }
+    }
     // The log is written directly, not through the PC build's pipe + writer thread: a crash right
     // after start must still leave every line in log.txt.
     setDefault("TTT2_LOG_ASYNC", "0");

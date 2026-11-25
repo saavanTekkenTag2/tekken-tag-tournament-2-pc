@@ -22,6 +22,8 @@
 #include <vector>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
+#include <filesystem>
 
 #include "setup/game_data.h"
 #include "setup/stfs.h"
@@ -267,4 +269,43 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_saavan_ttt2_Native_install(JNIEnv*
     // Take back what this run wrote (newest first)
     for (auto it = job.written.rbegin(); it != job.written.rend(); ++it) std::remove(it->c_str());
     return env->NewStringUTF(job.error.empty() ? "Installation failed." : job.error.c_str());
+}
+
+// r23: Java: static native String buildShaders(String root, Native.Listener listener)
+// Every shader in the installed game (game/data002.bin, data003.bin, tekken.img) translated and compiled into the
+// shader cache ahead of time - the PC installer's --build-shaders step (gpu_hw_d3d11.h PrebuildShaders). Without
+// it a match's first start compiles its shaders while it runs (black stage, characters drawn late; one vertex
+// shader took 28 s on a phone). Resumable: shaders already in the cache are skipped. Null = done, else the error.
+extern int GpuPrebuildShadersProgress(const std::vector<std::filesystem::path>& files, unsigned threads,
+                                      bool (*progress)(void* user, size_t done, size_t total), void* user);
+extern "C" JNIEXPORT jstring JNICALL Java_com_saavan_ttt2_Native_buildShaders(JNIEnv* env, jclass, jstring jroot, jobject listener)
+{
+    const char* c = env->GetStringUTFChars(jroot, nullptr);
+    std::string root(c ? c : "");
+    if (c) env->ReleaseStringUTFChars(jroot, c);
+    while (root.size() > 1 && root.back() == '/') root.pop_back();
+    setenv("LOCALAPPDATA", root.c_str(), 1);          // the game's cache: <root>/TTT2Recomp/shadercache
+    struct Ctx { JNIEnv* env; jobject listener; jmethodID progress, cancelled; } ctx{ env, listener, nullptr, nullptr };
+    jclass cls = env->GetObjectClass(listener);
+    ctx.progress = env->GetMethodID(cls, "progress", "(ILjava/lang/String;)V");
+    ctx.cancelled = env->GetMethodID(cls, "cancelled", "()Z");
+    auto cb = [](void* user, size_t done, size_t total) -> bool {
+        Ctx& x = *static_cast<Ctx*>(user);
+        char text[96];
+        std::snprintf(text, sizeof(text), "Building shaders: %zu / %zu", done, total);
+        jstring js = x.env->NewStringUTF(text);
+        x.env->CallVoidMethod(x.listener, x.progress, jint(total ? done * 100 / total : 0), js);
+        x.env->DeleteLocalRef(js);
+        return x.env->CallBooleanMethod(x.listener, x.cancelled) != JNI_TRUE;
+    };
+    const std::string game = root + "/game";
+    // All cores but one: the launcher stays responsive.
+    const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    const unsigned threads = unsigned(cores > 2 ? cores - 1 : 1);
+    std::fprintf(stderr, "[shaders] building from %s on %u threads\n", game.c_str(), threads);
+    const int rc = GpuPrebuildShadersProgress({ game + "/data002.bin", game + "/data003.bin", game + "/tekken.img" }, threads, cb, &ctx);
+    if (rc == 0) return nullptr;
+    char err[96];
+    std::snprintf(err, sizeof(err), rc == 6 ? "Stopped - it continues where it left off next time." : "Shader build failed (code %d).", rc);
+    return env->NewStringUTF(err);
 }

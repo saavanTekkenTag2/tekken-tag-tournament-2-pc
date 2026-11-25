@@ -29,6 +29,7 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        LauncherActivity.useFullScreen(this);     // r23: the picture under the camera cut-out too
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (mLayout != null && getSharedPreferences("ttt2", MODE_PRIVATE).getBoolean("touch", true)) {

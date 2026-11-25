@@ -1,31 +1,34 @@
 package com.saavan.ttt2;
 
-/** The CREDITS page (r22). Edit here. */
+/** The CREDITS page (r23: Catonix's profile card, as in the WWE 2K16 port). Edit here. */
 final class Credits {
     private Credits() {}
 
-    /** The Android port's author, shown first and in the home screen's corner. */
-    static final String PORT_BY = "SAVAN INDURKAR";
-    static final String GITHUB = "github.com/Savanindurkar7";
+    /** The Android port's author, shown on the credits card and in the home screen's corner. */
+    static final String PORT_BY = "CATONIX";
+    static final String SUBTITLE = "Port of Tekken Tag Tournament 2 to Android";
 
-    /** Catonix: shown with a profile photo (res/drawable-nodpi/catonix.jpg or .png; a badge when it is not there). */
-    static final String CATONIX = "CATONIX";
-    static final String[][] CATONIX_LINKS = {
-            {"YOUTUBE", "https://youtube.com/@catonix-ru7"},
-            {"WEBSITE", "http://volvisionmods.com"},
-            {"TELEGRAM", "https://t.me/catonixports"},
+    /** Profile photo: res/drawable-nodpi/catonix.png. Links: label, address, note. */
+    static final String[][] LINKS = {
+            {"YouTube", "https://youtube.com/@catonix-ru7", ""},
+            {"Website", "http://volvisionmods.com", ""},
+            {"Telegram", "https://t.me/catonixports", "(updates, help, send logs)"},
+    };
+    /** The card's buttons: label, address. */
+    static final String[][] BUTTONS = {
+            {"Open YouTube Channel", "https://youtube.com/@catonix-ru7"},
+            {"Open Website", "http://volvisionmods.com"},
+            {"Telegram Channel", "https://t.me/catonixports"},
     };
 
-    /** Everyone whose work is in this app. */
+    /** The work this app is built on. */
     static final String[][] THANKS = {
-            {"Android port", PORT_BY + " (" + GITHUB + ")"},
-            {"Ports community", "CATONIX (YouTube, VolVision Mods, Telegram)"},
-            {"Tekken Tag Tournament 2 PC recompilation", "shihabal3amri and contributors (github.com/shihabal3amri/tekken-tag-tournament-2-pc)"},
+            {"Tekken Tag Tournament 2 PC recompilation", "shihabal3amri and contributors - the PC port this Android version is built on"},
             {"XenonRecomp", "hedge-dev: the Xbox 360 static recompiler (MIT)"},
             {"References", "Unleashed Recompiled (hedge-dev) and the Xenia project"},
             {"DXVK native", "Philip Rebohle, Joshua Ashton and contributors: Direct3D 11 on Vulkan (zlib licence)"},
             {"dxvk-async", "Sporif and contributors: background pipeline compilation (zlib licence)"},
-            {"vkd3d-shader", "The Wine project: HLSL shader compiler on Android (LGPL)"},
+            {"vkd3d-shader", "The Wine project: the HLSL shader compiler (LGPL)"},
             {"SDL 2", "Window, input and audio (zlib licence)"},
             {"FFmpeg", "XMA audio and video decoding (LGPL)"},
             {"libmspack, tiny-AES-c", "LZX decompression (LGPL) and AES"},

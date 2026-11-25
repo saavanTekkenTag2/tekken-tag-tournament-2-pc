@@ -4585,8 +4585,7 @@ private:
             static int n = [] {
                 if (const char* e = std::getenv("TTT2_SHADER_THREADS"); e && std::atoi(e) > 0) return std::atoi(e);
 #ifdef __ANDROID__
-                const int little = ttt2_affinity::Get().nLittle;
-                return little > 1 ? std::min(3, little - 1) : 2;
+                return 2;
 #else
                 return 4;
 #endif
@@ -4595,9 +4594,8 @@ private:
         }
         BuildGate()
         {
-#ifdef __ANDROID__
-            ttt2_affinity::BackgroundThread();
-#endif
+            // r23: no longer moved to the little cores at a lower priority - a shader the frame waits for (its draws
+            // skipped or on the CPU vertex stage) took 28 s there (MEASURED 2026-11-25, log of r22) instead of 1.5-11.
             std::unique_lock lock(M());
             Cv().wait(lock, [] { return Free() > 0; });
             --Free();
@@ -5019,6 +5017,10 @@ float4 main(PSIn input) : SV_Target
         return 0;
     }
 
+    // r23 (Android launcher "BUILD SHADERS"): progress (done, total) and cancel - false stops the build.
+    using PrebuildProgressFn = bool (*)(void* user, size_t done, size_t total);
+    static PrebuildProgressFn& PrebuildProgress() { static PrebuildProgressFn f = nullptr; return f; }
+    static void*& PrebuildUser() { static void* u = nullptr; return u; }
     static int PrebuildShaders(const std::vector<std::filesystem::path>& files, unsigned threads)
     {
         const std::filesystem::path dir = ShaderCacheDirectory();
@@ -5072,10 +5074,12 @@ float4 main(PSIn input) : SV_Target
                      list.size() - pixelCount);
         std::fflush(stdout);
         std::atomic<size_t> next{ 0 }, done{ 0 }, compiled{ 0 }, untranslatable{ 0 }, failed{ 0 };
+        std::atomic<bool> stop{ false };
         auto worker = [&] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             for (;;)
             {
+                if (stop.load()) return;
                 const size_t i = next++;
                 if (i >= list.size()) return;
                 const auto& [key, code] = list[i];
@@ -5130,9 +5134,12 @@ float4 main(PSIn input) : SV_Target
         {
             const size_t d = done.load();
             if (d != shown) { std::fprintf(stdout, "[shaders] %zu/%zu\n", d, list.size()); std::fflush(stdout); shown = d; }
+            if (PrebuildProgress() && !PrebuildProgress()(PrebuildUser(), d, list.size())) { stop = true; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         for (auto& t : pool) t.join();
+        if (stop.load()) { std::fprintf(stdout, "[shaders] stopped at %zu/%zu\n", done.load(), list.size()); return 6; }
+        if (PrebuildProgress()) PrebuildProgress()(PrebuildUser(), list.size(), list.size());
         std::fprintf(stdout, "[shaders] %zu/%zu\n[shaders] done in %.1f s on %u threads: %zu compiled, %zu already cached, %zu not translatable, %zu failed\n",
                      list.size(), list.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), threads,
                      compiled.load(), list.size() - compiled.load() - untranslatable.load() - failed.load(), untranslatable.load(), failed.load());
@@ -5188,6 +5195,9 @@ private:
             BuildCounts total;
             auto worker = [&] {
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#ifdef __ANDROID__
+                ttt2_affinity::BackgroundThread();      // r23: the boot warm-up off the game's cores (menu frame rate)
+#endif
                 BuildCounts n;
                 for (size_t i; (i = next++) < files.size();)
                 {
