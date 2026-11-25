@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -15,6 +16,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.View;
@@ -31,6 +33,9 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 import java.io.InputStreamReader;
 import java.util.regex.Pattern;
 
@@ -186,6 +191,11 @@ public class LauncherActivity extends Activity {
         LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         fp.leftMargin = dp(18);
         row5.addView(frames, fp);
+        Button export = button("Export debug", Color.rgb(60, 60, 60));
+        export.setOnClickListener(v -> exportDebug());
+        LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        ep.leftMargin = dp(12);
+        row5.addView(export, ep);
         col.addView(row5, lp(10));
 
         info = label("", 12, Color.GRAY);
@@ -338,6 +348,39 @@ public class LauncherActivity extends Activity {
         }
     }
 
+    private static void zipDir(ZipOutputStream z, File dir, String prefix, long maxEach) throws java.io.IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        byte[] buf = new byte[65536];
+        for (File f : files) {
+            if (f.isDirectory()) { zipDir(z, f, prefix + f.getName() + "/", maxEach); continue; }
+            String n = f.getName();
+            if (n.endsWith(".dxbc") || n.endsWith(".bin") || f.length() > maxEach) continue;
+            z.putNextEntry(new ZipEntry(prefix + n));
+            try (InputStream in = new FileInputStream(f)) { int r; while ((r = in.read(buf)) > 0) z.write(buf, 0, r); }
+            z.closeEntry();
+        }
+    }
+
+    /** Logs, the self-test, frame dumps and traced shaders as Download/ttt2-debug-<time>.zip, to attach to a message. */
+    private void exportDebug() {
+        String name = "ttt2-debug-" + new java.text.SimpleDateFormat("MMdd-HHmmss", java.util.Locale.US).format(new java.util.Date()) + ".zip";
+        try {
+            ContentValues v = new ContentValues();
+            v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+            v.put(MediaStore.Downloads.MIME_TYPE, "application/zip");
+            Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+            if (uri == null) throw new Exception("could not create the file in Download");
+            try (OutputStream os = getContentResolver().openOutputStream(uri); ZipOutputStream z = new ZipOutputStream(os)) {
+                zipDir(z, new File(dataRoot(this), "TTT2Recomp"), "TTT2Recomp/", 40_000_000L);
+                zipDir(z, new File(dataRoot(this), "ttt2/port"), "ttt2/port/", 40_000_000L);
+            }
+            status.setText("Saved Download/" + name + " - attach it to your message.");
+        } catch (Exception e) {
+            status.setText("Export failed: " + e);
+        }
+    }
+
     /** Debug: the game's rendered frame (fb_native.bmp) and the window's back buffer (fb_back.bmp). */
     private void showFrames() {
         File dir = new File(dataRoot(this), "ttt2/port");
@@ -367,6 +410,8 @@ public class LauncherActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         String crash = tail(new File(dir, "crash.txt"), 20_000);
         if (crash != null && !crash.isEmpty()) sb.append("===== crash.txt =====\n").append(crash).append("\n");
+        String gst = tail(new File(dir, "gpu_selftest.txt"), 8_000);
+        if (gst != null) sb.append("===== gpu_selftest.txt =====\n").append(gst).append("\n");
         String start = tail(new File(dir, "log_start.txt"), 4_000);
         if (start != null) sb.append("===== log_start.txt =====\n").append(start).append("\n");
         String key = keyLines(new File(dir, "log.txt"));

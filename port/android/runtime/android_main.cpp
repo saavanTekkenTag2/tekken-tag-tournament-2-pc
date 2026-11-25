@@ -31,6 +31,7 @@
 int ttt2_main(int argc, char** argv);                       // main.cpp
 extern "C" void Ttt2InstallSignalHandlers(void);            // win32_memory.cpp
 extern "C" void Ttt2SetCommandLine(int argc, char** argv);  // win32_core.cpp
+extern "C" void Ttt2GpuSelfTest(const char* root);           // gpu_selftest_android.cpp
 
 extern "C" void Ttt2SetTouchPad(uint32_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry, uint32_t lt, uint32_t rt);   // win32_sdl.cpp
 
@@ -166,7 +167,18 @@ extern "C" int SDL_main(int argc, char* argv[])
     }
     // Launcher "Debug: save frames": the rendered frame and the window's back buffer as BMPs once a
     // second (gpu_hw_d3d11.h TTT2_FB_NATIVE) in <root>/ttt2/port, shown by the launcher's Frames button.
-    if (fbdump) setenv("TTT2_FB_NATIVE", "1", 1);
+    if (fbdump)
+    {
+        setenv("TTT2_FB_NATIVE", "1", 1);
+        // Every game shader compiled afresh (an empty cache) and its HLSL kept, for the launcher's Export debug.
+        const std::string shaders = root + "/ttt2/port/shaders", cache = root + "/ttt2/port/shadercache-debug";
+        std::string rm = "rm -rf '" + shaders + "' '" + cache + "'";
+        if (std::system(rm.c_str()) != 0) {}
+        MakeDirs(shaders);
+        MakeDirs(cache);
+        setenv("TTT2_SHADER_TRACE", shaders.c_str(), 1);
+        setenv("TTT2_SHADER_CACHE", cache.c_str(), 1);
+    }
 #ifdef __ANDROID__
     if (root.empty() && SDL_AndroidGetExternalStorageState() & SDL_ANDROID_EXTERNAL_STORAGE_WRITE)
         if (const char* e = SDL_AndroidGetExternalStoragePath()) root = e;
@@ -204,6 +216,8 @@ extern "C" int SDL_main(int argc, char* argv[])
 #endif
     InstallCrashReport(root);          // first: the Win32 layer's handler chains to it
     Ttt2InstallSignalHandlers();
+    // A few tiny D3D11 jobs read back and compared: TTT2Recomp/gpu_selftest.txt (launcher Logs).
+    if (const char* st = std::getenv("TTT2_GPU_SELFTEST"); !(st && *st == '0')) Ttt2GpuSelfTest(root.c_str());
     std::fprintf(stderr, "[android] SDL_main: root %s, starting the game\n", root.c_str());
 
     // The installed layout is detected with no arguments (argc == 1), as the PC game started

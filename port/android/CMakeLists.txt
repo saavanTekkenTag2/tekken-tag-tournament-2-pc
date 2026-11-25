@@ -92,7 +92,8 @@ set(RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/abi_bridges.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/d3dcompile_vkd3d.cpp"      # D3DCompile over vkd3d-shader
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/android_install.cpp"       # disc + TU3 -> game folder (JNI)
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/path_wrap.cpp")            # Windows paths through fopen/open/stat (--wrap below)
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/path_wrap.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gpu_selftest_android.cpp")  # D3D11/DXVK/vkd3d self-test before the game            # Windows paths through fopen/open/stat (--wrap below)
 if(NOT TTT2_D3D_LIBS)
     list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/d3d_unavailable.cpp")
 endif()
