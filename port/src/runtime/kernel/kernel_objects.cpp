@@ -984,6 +984,7 @@ static void MainLongWait(uint64_t t0, const char* api, uint32_t which, int64_t t
     std::fputs(line, stderr);
 }
 
+uint32_t KernelGuestEventState(uint32_t addr);   // below
 // Diagnose stuck boots: an infinite wait blocking >15s prints its guest backtrace once
 // (walk the PPC backchain: [r1] = caller frame, saved LR at [callerFrame - 8]).
 uint32_t CurrentGuestEntry();                          // kernel_thread.cpp
@@ -1021,7 +1022,7 @@ static uint32_t WaitDiag(KObject* o, int64_t ms, PPCContext& ctx, uint8_t* base,
     }
     uint32_t r = wait(15000);
     if (r != STATUS_TIMEOUT) return r;
-    char line[512];
+    char line[1024];
     int n = std::snprintf(line, sizeof(line), "[longwait] %s obj=%08X lr=%08X bt:",
                           api, which, (uint32_t)ctx.lr);
     n = AppendGuestBacktrace(line, n, sizeof(line), ctx, base);
@@ -1037,6 +1038,11 @@ static uint32_t WaitDiag(KObject* o, int64_t ms, PPCContext& ctx, uint8_t* base,
         if (obj && obj < 0xFFFFFE00u)
             n += std::snprintf(line + n, sizeof(line) - n, " ctr[obj+384]=%08X",
                 __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + obj + 384)));
+        // The object itself: its header and what follows, and its host event's state (bit 0 bound, 1 set, 2 manual).
+        n += std::snprintf(line + n, sizeof(line) - n, " | obj@%08X:", which);
+        for (int i = 0; i < 8 && n < (int)sizeof(line) - 16; ++i)
+            n += std::snprintf(line + n, sizeof(line) - n, " %08X", __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + which + i * 4)));
+        n += std::snprintf(line + n, sizeof(line) - n, " host=%X", KernelGuestEventState(which));
     }
     std::snprintf(line + n, sizeof(line) - n, "\n");
     std::fputs(line, stderr);

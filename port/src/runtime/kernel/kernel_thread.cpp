@@ -239,6 +239,46 @@ void KernelPublishMainGuestContext(PPCContext* ctx) { PublishGuestContext(ctx, 0
 uint32_t CurrentGuestEntry() { return t_contextSlot ? t_contextSlot->entry : 0; }
 PPCContext* CurrentGuestContext() { return t_contextSlot ? t_contextSlot->ctx : nullptr; }
 
+// [mv] trace (Android 2026-11-25: the game froze for good after the opening movie was skipped - the main thread in
+// KeWait at 8277F090 while the next movie's player came up with two of its threads, not three). From the moment the
+// first XMV player thread (entries 8277D9F8..8277DA88) ends, every kernel import called on a movie player thread, or
+// from the movie code (lr 82770000..8278FFFF) on any thread, goes to the log with its caller and arguments - the first
+// 3000. TTT2_MOVIE_TRACE=0: off; =1: from the start.
+static std::atomic<int> g_movieTraceArmed{ -1 };
+static bool MovieEntry(uint32_t e) { return e >= 0x8277D9F8u && e <= 0x8277DA88u; }
+static void MovieTraceArm(const char* why)
+{
+    int expect = 0;
+    if (g_movieTraceArmed.compare_exchange_strong(expect, 1))
+        std::fprintf(stderr, "[mv] trace armed: %s\n", why);
+}
+static bool MovieTraceOn()
+{
+    int v = g_movieTraceArmed.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        const char* e = std::getenv("TTT2_MOVIE_TRACE");
+        const int want = e && e[0] == '0' ? 2 : e && e[0] == '1' ? 1 : 0;   // 2: never
+        g_movieTraceArmed.compare_exchange_strong(v, want);
+        v = g_movieTraceArmed.load(std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+void MovieTraceNote(const char* name)
+{
+    if (!MovieTraceOn()) return;
+    PPCContext* ctx = t_contextSlot ? t_contextSlot->ctx : nullptr;
+    if (!ctx) return;
+    const uint32_t entry = t_contextSlot->entry, lr = uint32_t(ctx->lr);
+    if (!MovieEntry(entry) && !(lr >= 0x82770000u && lr < 0x82790000u)) return;
+    static std::atomic<int> lines{ 0 };
+    const int n = lines.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 3000) return;
+    std::fprintf(stderr, "[mv] %lu e=%08X %s lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X%s\n",
+                 (unsigned long)GetCurrentThreadId(), entry, name, lr, ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32,
+                 ctx->r7.u32, ctx->r8.u32, n == 2999 ? " (the last [mv] line)" : "");
+}
+
 // TTT2_WTRACE=1: log the guest caller (lr) of wait/sleep primitives to find spin loops.
 bool WTrace() { static const bool on = std::getenv("TTT2_WTRACE") != nullptr; return on; }
 
@@ -707,6 +747,13 @@ PPC_FUNC(__imp__ExCreateThread)
 
     // creationFlags bit0 = created suspended. For bring-up we start immediately if not suspended.
     bool suspended = (creationFlags & 1) != 0;
+    if (MovieEntry(startAddress) || MovieTraceOn())
+    {
+        static std::atomic<int> createLogs{ 0 };
+        if (createLogs.fetch_add(1, std::memory_order_relaxed) < 200)
+            std::fprintf(stderr, "[mv] ExCreateThread start=%08X ctx=%08X flags=%08X stack=%08X lr=%08X (caller host %lu)\n",
+                         startAddress, startContext, creationFlags, ctx.r4.u32, uint32_t(ctx.lr), (unsigned long)GetCurrentThreadId());
+    }
     // The save manager's save / load job (rollback.cpp's SaveJobRunning): its timeline while a session runs (log only).
     const bool saveJob = startAddress == 0x8258B2C0u || startAddress == 0x8258B2D8u;
     if (saveJob) RollbackSaveJobMark(startAddress == 0x8258B2C0u ? "save job requested" : "load job requested", true, -1);
@@ -716,6 +763,13 @@ PPC_FUNC(__imp__ExCreateThread)
         t_saveJobThread = saveJob;
         if (saveJob) RollbackSaveJobMark("job thread running", false, -1);
         GuestRun2(startAddress, startContext, 0);
+        if (MovieEntry(startAddress))
+        {
+            MovieTraceOn();                                    // reads TTT2_MOVIE_TRACE once
+            char why[96];
+            std::snprintf(why, sizeof(why), "movie player thread %08X (host %lu) ended", startAddress, (unsigned long)GetCurrentThreadId());
+            MovieTraceArm(why);
+        }
         GuestThreadEnded();                                    // block, context slot and record given back
         t_saveJobThread = false;
         if (saveJob) { XamSaveJobBoxClear(); RollbackSaveJobMark("job thread ended", false, -1); }

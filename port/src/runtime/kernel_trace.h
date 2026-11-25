@@ -25,8 +25,10 @@ inline bool KTraceOn()
 }
 
 void RollbackImportNote(const char* name);   // kernel/rollback.cpp: the online tasks' imports (diagnostics)
+void MovieTraceNote(const char* name);       // kernel/kernel_thread.cpp: the XMV movie player's imports (diagnostics)
 inline void KTrace(const char* name)
 {
     if (KTraceOn()) std::fprintf(stderr, "[k] %s\n", name);
     RollbackImportNote(name);
+    MovieTraceNote(name);
 }
