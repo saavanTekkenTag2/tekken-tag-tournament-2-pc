@@ -49,6 +49,42 @@ PATCHES = [
      '      m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeDenormPreserve, 1, &width32);\n'
      '    }\n\n'
      '    if (flags.test(DxbcFloatControlFlag::PreserveNan32)) {'),
+    # Android: the window's surface is gone while the app is in the background (and replaced when it comes back).
+    # Presenting then made DXVK recreate the swap chain and build a Vulkan surface from a null ANativeWindow - a
+    # crash inside libvulkan (createSurface <- recreateSwapChain <- Present). Without a window the surface is
+    # reported lost, the swap chain stays empty (presents answer DXGI_STATUS_OCCLUDED) and is rebuilt once the
+    # window is back.
+    ("src/wsi/sdl2/wsi_presenter_sdl2.cpp",
+     '#include <SDL2/SDL_vulkan.h>\n',
+     '#include <SDL2/SDL_vulkan.h>\n#include <SDL2/SDL_syswm.h>\n'),
+    ("src/wsi/sdl2/wsi_presenter_sdl2.cpp",
+     '    SDL_Window* window = fromHwnd(hWindow);\n\n    return SDL_Vulkan_CreateSurface(',
+     '    SDL_Window* window = fromHwnd(hWindow);\n'
+     '#ifdef __ANDROID__\n'
+     '    {\n'
+     '      SDL_SysWMinfo wm;\n'
+     '      SDL_VERSION(&wm.version);\n'
+     '      if (!window || !SDL_GetWindowWMInfo(window, &wm) || !wm.info.android.window)\n'
+     '        return VK_ERROR_SURFACE_LOST_KHR;\n'
+     '    }\n'
+     '#endif\n\n'
+     '    return SDL_Vulkan_CreateSurface('),
+    ("src/vulkan/vulkan_presenter.cpp",
+     '    VkResult status;\n    \n    if ((status = m_vki->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(',
+     '    VkResult status;\n    \n'
+     '    if (!m_surface && (status = createSurface()) != VK_SUCCESS)\n'
+     '      return status;   // Android: no window yet (app in the background)\n\n'
+     '    if ((status = m_vki->vkGetPhysicalDeviceSurfaceCapabilitiesKHR('),
+    ("src/d3d11/d3d11_swapchain.cpp",
+     '    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS)\n      throw DxvkError("D3D11SwapChain: Failed to recreate swap chain");\n',
+     '    if (m_presenter->recreateSwapChain(presenterDesc) != VK_SUCCESS) {\n'
+     '      static uint32_t notes = 0;\n'
+     '      if (notes++ < 20) Logger::warn("D3D11SwapChain: no swap chain for now (no window: app in the background?) - presents skipped");\n'
+     '      return;\n'
+     '    }\n'),
+    ("src/d3d11/d3d11_swapchain.cpp",
+     '      SynchronizePresent();\n\n      if (!m_presenter->hasSwapChain())\n        return DXGI_STATUS_OCCLUDED;\n',
+     '      SynchronizePresent();\n\n      if (!m_presenter->hasSwapChain()) {\n        RecreateSwapChain(m_vsync);   // the window may be back\n        if (!m_presenter->hasSwapChain())\n          return DXGI_STATUS_OCCLUDED;\n      }\n'),
 ]
 
 def apply(rel, old, new):

@@ -4457,6 +4457,26 @@ private:
         if (FAILED(hr))
         {
             std::string why = errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize()) : "D3DCompile failed";
+#ifdef __ANDROID__
+            // Android (vkd3d-shader's HLSL compiler, not Microsoft's): the translated source of a shader that fails
+            // goes to %LOCALAPPDATA%/TTT2Recomp/failed_shaders/<hash>.hlsl with the errors on top - "Export debug"
+            // picks them up, so the translator can be fixed for what vkd3d rejects (the first 80).
+            static std::atomic<int> dumped{ 0 };
+            if (const char* local = std::getenv("LOCALAPPDATA"); local && dumped.fetch_add(1) < 80)
+            {
+                std::error_code ec;
+                const std::filesystem::path dir = std::filesystem::path(local) / "TTT2Recomp" / "failed_shaders";
+                std::filesystem::create_directories(dir, ec);
+                char file[32];
+                std::snprintf(file, sizeof(file), "%016llX.hlsl", (unsigned long long)std::hash<std::string>{}(text));
+                if (std::FILE* f = std::fopen((dir / file).string().c_str(), "wb"))
+                {
+                    std::fprintf(f, "// target %s, name %s\n/* errors:\n%s\n*/\n", target, name ? name : "", why.c_str());
+                    std::fwrite(text.data(), 1, text.size(), f);
+                    std::fclose(f);
+                }
+            }
+#endif
             throw std::runtime_error(why);
         }
         return code;
@@ -7153,6 +7173,14 @@ private:
                     }
                     if (at) std::snprintf(split + at, sizeof(split) - at, ")");
                 }
+#ifdef __ANDROID__
+                // Android: the log is written synchronously to shared storage, which is slow; at most 2 lines a
+                // second (a run of slow frames wrote one per frame and made the drops worse).
+                static auto slowWindow = std::chrono::steady_clock::now();
+                static int slowInWindow = 0;
+                if (const auto now = std::chrono::steady_clock::now(); now - slowWindow > std::chrono::seconds(1)) { slowWindow = now; slowInWindow = 0; }
+                if (++slowInWindow <= 2)
+#endif
                 std::fprintf(stderr, "[slowframe] %.1f ms at %02u:%02u:%02u.%03u: renderer %.1f%s, draw packets %.1f; game thread's frame kick %.1f "
                                      "(waiting for the command processor %.1f); draws %llu (gpu-vs %llu), resolves %llu, vertex data %llu KB, "
                                      "render width %u (%u draws; %u px at the render scale %.2f); game main thread: on the processor %.1f, "

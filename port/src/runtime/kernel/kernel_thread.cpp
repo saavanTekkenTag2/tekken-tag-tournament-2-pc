@@ -255,7 +255,7 @@ static bool MovieTraceOn()
     if (v < 0)
     {
         const char* e = std::getenv("TTT2_MOVIE_TRACE");
-        g_movieTraceArmed.compare_exchange_strong(v, e && e[0] == '0' ? 2 : 1);
+        g_movieTraceArmed.compare_exchange_strong(v, e && e[0] == '1' ? 1 : 2);   // off since r19: the freeze is fixed
         v = g_movieTraceArmed.load(std::memory_order_relaxed);
     }
     return v == 1;

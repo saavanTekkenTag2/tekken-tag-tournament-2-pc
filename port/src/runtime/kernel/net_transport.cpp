@@ -442,7 +442,8 @@ bool Start(Receiver receiver)
             return true;
         }
         if (needSteam) return false;
-        std::fprintf(stderr, "[net] Steam unavailable - loopback transport (this PC only)\n");
+        static bool said = false;   // once: the transport starts again and again (a line per frame on Android)
+        if (!said) { said = true; std::fprintf(stderr, "[net] Steam unavailable - loopback transport (this PC only)\n"); }
     }
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa)) return false;
