@@ -160,7 +160,7 @@ public class LauncherActivity extends Activity {
         LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         tp.leftMargin = dp(18);
         row4.addView(touch, tp);
-        Button log = button("Last log", Color.rgb(60, 60, 60));
+        Button log = button("Logs", Color.rgb(60, 60, 60));
         log.setOnClickListener(v -> showLog());
         LinearLayout.LayoutParams lpp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lpp.leftMargin = dp(18);
@@ -254,28 +254,51 @@ public class LauncherActivity extends Activity {
         startActivity(new Intent(this, GameActivity.class));
     }
 
-    private void showLog() {
-        File f = new File(dataRoot(this), "TTT2Recomp/log.txt");
-        String text;
+    private static String tail(File f, int max) {
+        if (!f.isFile()) return null;
         try (InputStream in = new FileInputStream(f)) {
-            byte[] b = new byte[(int) Math.min(f.length(), 200_000)];
+            byte[] b = new byte[(int) Math.min(f.length(), max)];
             long skip = f.length() - b.length;
             if (skip > 0) in.skip(skip);
             int n = in.read(b);
-            text = new String(b, 0, Math.max(n, 0), "UTF-8");
+            return new String(b, 0, Math.max(n, 0), "UTF-8");
         } catch (Exception e) {
-            text = "No log yet (" + f + ")";
+            return null;
         }
-        final String all = text;
+    }
+
+    /** crash.txt (if the last start crashed), log_start.txt, the end of log.txt, the DXVK logs. */
+    private void showLog() {
+        File dir = new File(dataRoot(this), "TTT2Recomp");
+        StringBuilder sb = new StringBuilder();
+        String crash = tail(new File(dir, "crash.txt"), 20_000);
+        if (crash != null && !crash.isEmpty()) sb.append("===== crash.txt =====\n").append(crash).append("\n");
+        String start = tail(new File(dir, "log_start.txt"), 4_000);
+        if (start != null) sb.append("===== log_start.txt =====\n").append(start).append("\n");
+        String log = tail(new File(dir, "log.txt"), 150_000);
+        sb.append("===== log.txt (end) =====\n").append(log != null ? log : "no log yet (" + dir + "/log.txt)").append("\n");
+        File[] others = dir.listFiles((d, name) -> name.endsWith(".log"));
+        if (others != null)
+            for (File f : others) {
+                String t = tail(f, 20_000);
+                if (t != null) sb.append("===== ").append(f.getName()).append(" (end) =====\n").append(t).append("\n");
+            }
+        final String all = sb.toString();
         TextView tv = label(all, 11, Color.WHITE);
         tv.setTypeface(Typeface.MONOSPACE);
         tv.setTextIsSelectable(true);
         tv.setPadding(dp(10), dp(10), dp(10), dp(10));
         ScrollView sv = new ScrollView(this);
         sv.addView(tv);
-        sv.post(() -> sv.fullScroll(View.FOCUS_DOWN));
-        new AlertDialog.Builder(this).setTitle("log.txt (end)").setView(sv)
-            .setPositiveButton("Copy", (d, w) -> ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("ttt2 log", all)))
+        new AlertDialog.Builder(this).setTitle("Logs").setView(sv)
+            .setPositiveButton("Copy all", (d, w) -> ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("ttt2 log", all)))
+            .setNeutralButton("Share", (d, w) -> {
+                Intent i = new Intent(Intent.ACTION_SEND);
+                i.setType("text/plain");
+                i.putExtra(Intent.EXTRA_SUBJECT, "TTT2 Android log");
+                i.putExtra(Intent.EXTRA_TEXT, all.length() > 90_000 ? all.substring(all.length() - 90_000) : all);
+                startActivity(Intent.createChooser(i, "Share log"));
+            })
             .setNegativeButton("Close", null).show();
     }
 

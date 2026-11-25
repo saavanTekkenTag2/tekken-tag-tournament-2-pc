@@ -1,0 +1,10 @@
+/* libmain.so exports only what Android and SDL2 look up: SDL_main (SDLActivity -> dlsym) and the
+   JNI entry points. Everything else stays local - a much smaller dynamic symbol table (the
+   recompiled game has tens of thousands of functions), a smaller APK and a faster load. */
+{
+  global:
+    SDL_main;
+    Java_*;
+  local:
+    *;
+};

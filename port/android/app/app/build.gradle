@@ -25,7 +25,7 @@ android {
     }
     packagingOptions {
         jniLibs {
-            useLegacyPackaging = false            // stored uncompressed, page aligned
+            useLegacyPackaging = true             // compressed in the APK (about a third of the size), unpacked at install
             keepDebugSymbols += ['**/*.so']       // already stripped by the build script
         }
     }

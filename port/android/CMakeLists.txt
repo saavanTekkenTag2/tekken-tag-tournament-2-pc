@@ -104,4 +104,5 @@ set_property(SOURCE "${RUNTIME}/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS TT
 target_compile_options(main PRIVATE -O2 -include msvc_crt.h -Wno-everything -ffp-contract=off -fno-strict-aliasing -fno-autolink)
 target_link_libraries(main PRIVATE tekken_ppc ttt2_ffmpeg ttt2_setup_core ttt2_win32 vkd3d_shader SDL2::SDL2 ${TTT2_D3D_LIBS} aaudio log android dl m)
 # #pragma comment(lib, "ws2_32.lib") & co. become ELF dependent-library records: ignore them.
-target_link_options(main PRIVATE -Wl,--gc-sections -Wl,--no-undefined -Wl,--no-dependent-libraries -Wl,-z,max-page-size=16384)
+target_link_options(main PRIVATE -Wl,--gc-sections -Wl,--no-undefined -Wl,--no-dependent-libraries -Wl,-z,max-page-size=16384 "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libmain.map")
+set_property(TARGET main APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/libmain.map")
