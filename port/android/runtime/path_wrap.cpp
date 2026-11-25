@@ -6,6 +6,7 @@
 // also after a '/', as std::filesystem::absolute makes them) or with backslashes go through the
 // same mapping as CreateFile (drive -> data root, '\' -> '/', case-insensitive lookup); other
 // paths pass through untouched.
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
@@ -35,6 +36,9 @@ struct Mapped
         if (!drive && !std::strchr(in, '\\')) return;
         const int n = Ttt2HostPath(drive ? drive : in, buf, sizeof buf, mustExist ? 1 : 0);
         if (n > 0 && size_t(n) < sizeof buf) p = buf;
+        // The first mappings in the log, so a missing file shows where it was looked for.
+        static std::atomic<int> logged{ 0 };
+        if (logged.fetch_add(1) < 40) std::fprintf(stderr, "[path] %s -> %s\n", in, p);
     }
 };
 bool Creates(int flags) { return (flags & O_CREAT) != 0; }

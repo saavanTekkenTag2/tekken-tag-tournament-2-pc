@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cerrno>
 #include <fstream>
 #include <thread>
 #include <chrono>
@@ -439,6 +440,9 @@ static int FaultFilter(EXCEPTION_POINTERS* ep)
 // player default here, unless already set: the game data, the hardware renderer, no debug frame
 // dumps, and - with no console attached (GUI subsystem, double-clicked) - the log in
 // %LOCALAPPDATA%\TTT2Recomp\log.txt. Returns the image path, or empty when not installed.
+#ifdef __ANDROID__
+extern "C" int Ttt2HostPath(const char* winPath, char* out, size_t outSize, int mustExist);   // port/android/win32
+#endif
 static std::string InstalledLayout(int argc)
 {
     if (argc > 1) return {};
@@ -747,8 +751,18 @@ int main(int argc, char** argv)
     const char* imgPath = (argc > 1) ? argv[1]
                         : !installedImage.empty() ? installedImage.c_str()
                         : "C:/ttt2/re/decrypted/Default_patched_tu3.bin";
+#ifdef __ANDROID__
+    // Android: the Windows path ("C:\\game\\tekken.img") to the file in the app's game folder (port/android/win32).
+    static char hostImage[1024];
+    const int hostLen = Ttt2HostPath(imgPath, hostImage, sizeof hostImage, 1);
+    if (hostLen > 0 && size_t(hostLen) < sizeof hostImage)
+    {
+        std::fprintf(stderr, "[android] image %s -> %s\n", imgPath, hostImage);
+        imgPath = hostImage;
+    }
+#endif
     std::ifstream img(imgPath, std::ios::binary);
-    if (!img) { std::fprintf(stderr, "cannot open image: %s\n", imgPath); return 1; }
+    if (!img) { std::fprintf(stderr, "cannot open image: %s (errno %d)\n", imgPath, errno); return 1; }
     img.read(reinterpret_cast<char*>(base + PPC_IMAGE_BASE), PPC_IMAGE_SIZE);
     std::fprintf(stderr, "[runtime] loaded %s (%llu bytes) at guest 0x%llX\n",
                  imgPath, (unsigned long long)img.gcount(), (unsigned long long)PPC_IMAGE_BASE);
