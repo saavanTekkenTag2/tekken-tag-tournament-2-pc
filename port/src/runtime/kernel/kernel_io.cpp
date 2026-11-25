@@ -545,6 +545,23 @@ PPC_FUNC(__imp__NtReadFile)
                       (unsigned long long)n, ctx.r3.u32, length, read, (unsigned long long)(bytes / 1024));
         std::fputs(line, stderr);
     }
+    // An asynchronous read (an event or an APC given) that ends at the end of the file answers STATUS_PENDING, as the
+    // console's disc reads do: the end of file arrives in the I/O status block, set above with the event signalled.
+    // MEASURED 2026-11-25 (Android r14 trace): the XMV movie player prefetches five 128 KB blocks; the title movie
+    // sits at the very end of data047.bin, so its third read starts past the end. Answered STATUS_END_OF_FILE at once,
+    // XAPI's ReadFile failed it on the spot (RtlNtStatusToDosError at 82BFC1F8), the player took that as a fatal error -
+    // its threads suspended themselves and the main thread waited for good at 8277F090 after the opening movie was
+    // skipped. TTT2_EOF_PENDING=0: the immediate status as before.
+    static const bool eofPending = [] { const char* e = std::getenv("TTT2_EOF_PENDING"); return !(e && e[0] == '0'); }();
+    if (status == STATUS_END_OF_FILE && eofPending && (event || apcRoutine))
+    {
+        static std::atomic<uint32_t> pendLog{0};
+        if (++pendLog <= 20)
+            std::fprintf(stderr, "[io] end of file on an asynchronous read of '%s' (off=%lld): answered pending, the status block says end of file\n",
+                         file->path.c_str(), (long long)effOff);
+        ctx.r3.u32 = 0x00000103u;   // STATUS_PENDING
+        return;
+    }
     ctx.r3.u32 = status;
 }
 

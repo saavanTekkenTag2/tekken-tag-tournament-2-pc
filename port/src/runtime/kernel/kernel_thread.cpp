@@ -789,7 +789,7 @@ PPC_FUNC(__imp__ExCreateThread)
     {
         static std::atomic<int> handleLogs{ 0 };
         if (handleLogs.fetch_add(1, std::memory_order_relaxed) < 200)
-            std::fprintf(stderr, "[mv] ExCreateThread start=%08X -> handle %08X%s\n", startAddress, KernelObjectHandle(obj), suspended ? " (suspended)" : "");
+            std::fprintf(stderr, "[mv] ExCreateThread start=%08X -> handle %08X%s\n", startAddress, GRead32(base, handlePtr), suspended ? " (suspended)" : "");
     }
     ctx.r3.u32 = STATUS_SUCCESS;
 }
@@ -813,7 +813,12 @@ PPC_FUNC(__imp__NtResumeThread)
 PPC_FUNC(__imp__NtSuspendThread)
 {
     KTrace("NtSuspendThread");
-    if (MovieTraceOn()) std::fprintf(stderr, "[mv] NtSuspendThread h=%08X lr=%08X thread %lu\n", ctx.r3.u32, uint32_t(ctx.lr), (unsigned long)GetCurrentThreadId());
+    if (MovieTraceOn())
+    {
+        static std::atomic<int> suspendLogs{ 0 };
+        if (suspendLogs.fetch_add(1, std::memory_order_relaxed) < 100)
+            std::fprintf(stderr, "[mv] NtSuspendThread h=%08X lr=%08X thread %lu\n", ctx.r3.u32, uint32_t(ctx.lr), (unsigned long)GetCurrentThreadId());
+    }
     if (WTrace()) std::fprintf(stderr, "[w] NtSuspendThread h=%08X lr=%08X\n", ctx.r3.u32, (uint32_t)ctx.lr);
     uint32_t previous = 0;
     const auto status = KernelSuspendThread(ctx.r3.u32, &previous);
