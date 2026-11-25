@@ -191,6 +191,14 @@ public class LauncherActivity extends Activity {
         LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         fp.leftMargin = dp(18);
         row5.addView(frames, fp);
+        CheckBox cpu = new CheckBox(this);
+        cpu.setText("CPU renderer (slow test)");
+        cpu.setTextColor(Color.LTGRAY);
+        cpu.setChecked(prefs.getBoolean("cpu", false));
+        cpu.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("cpu", on).apply());
+        LinearLayout.LayoutParams cpp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        cpp.leftMargin = dp(12);
+        row5.addView(cpu, cpp);
         Button export = button("Export debug", Color.rgb(60, 60, 60));
         export.setOnClickListener(v -> exportDebug());
         LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -387,7 +395,7 @@ public class LauncherActivity extends Activity {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(dp(10), dp(10), dp(10), dp(10));
-        for (String name : new String[] { "fb_native.bmp", "fb_back.bmp" }) {
+        for (String name : new String[] { "fb_native.bmp", "fb_back.bmp", "fbdump.bmp" }) {
             File f = new File(dir, name);
             col.addView(label(name + (f.isFile() ? "  (" + f.length() / 1024 + " KB, " + new java.util.Date(f.lastModified()) + ")" : "  - not saved yet"), 13, Color.WHITE));
             Bitmap b = f.isFile() ? readBmp(f) : null;

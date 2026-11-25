@@ -164,6 +164,9 @@ extern "C" int SDL_main(int argc, char* argv[])
     {
         if (i + 1 < argc && std::strcmp(argv[i], "--root") == 0) root = argv[i + 1];
         if (std::strcmp(argv[i], "--fbdump") == 0) fbdump = true;
+        // Launcher "Renderer: CPU": the game's software renderer (kernel_video.cpp / gpu_render.cpp) instead of
+        // D3D11 -> DXVK; slow, but it shows whether a black screen comes from the GPU path or from the game itself.
+        if (std::strcmp(argv[i], "--cpu") == 0) { setenv("TTT2_GPU_HW", "0", 1); setenv("TTT2_FBDUMP", "1", 1); }
     }
     // Launcher "Debug: save frames": the rendered frame and the window's back buffer as BMPs once a
     // second (gpu_hw_d3d11.h TTT2_FB_NATIVE) in <root>/ttt2/port, shown by the launcher's Frames button.
@@ -228,7 +231,7 @@ extern "C" int SDL_main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--root") == 0) { ++i; continue; }
-        if (std::strcmp(argv[i], "--fbdump") == 0) continue;
+        if (std::strcmp(argv[i], "--fbdump") == 0 || std::strcmp(argv[i], "--cpu") == 0) continue;
         args.push_back(argv[i]);
     }
     args.push_back(nullptr);

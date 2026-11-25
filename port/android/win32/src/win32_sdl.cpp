@@ -585,8 +585,46 @@ extern "C" int FillRect(HDC, const RECT*, HBRUSH) { return 1; }
 extern "C" HGDIOBJ GetStockObject(int) { return nullptr; }
 extern "C" BOOL DeleteObject(HGDIOBJ) { return TRUE; }
 extern "C" HBRUSH CreateSolidBrush(COLORREF) { return nullptr; }
-extern "C" int StretchDIBits(HDC, int, int, int, int, int, int, int, int hs, const void*, const BITMAPINFO*, UINT, DWORD) { return hs; }
-extern "C" int SetDIBitsToDevice(HDC, int, int, DWORD, DWORD h, int, int, UINT, UINT, const void*, const BITMAPINFO*, UINT) { return int(h); }
+// The CPU renderer's present (kernel_video.cpp, TTT2_GPU_HW=0): a 32-bit DIB onto the SDL window's software
+// surface, scaled to fit with black bars. Only used when no Vulkan swap chain owns the window.
+static int BlitDib(HDC dc, int srcW, int srcH, const void* bits, const BITMAPINFO* bmi)
+{
+    SDL_Window* win = reinterpret_cast<SDL_Window*>(dc);
+    if (!win || reinterpret_cast<uintptr_t>(dc) == 1 || !bits || !bmi || bmi->bmiHeader.biBitCount != 32) return 0;
+    const int w = bmi->bmiHeader.biWidth, h = std::abs(bmi->bmiHeader.biHeight);
+    if (w <= 0 || h <= 0) return 0;
+    SDL_Surface* screen = SDL_GetWindowSurface(win);
+    if (!screen) return 0;
+    // A bottom-up DIB (positive height): rows reversed into a copy first.
+    std::vector<uint32_t> flipped;
+    const void* top = bits;
+    if (bmi->bmiHeader.biHeight > 0)
+    {
+        flipped.resize(size_t(w) * h);
+        const uint32_t* in = static_cast<const uint32_t*>(bits);
+        for (int y = 0; y < h; ++y) std::memcpy(&flipped[size_t(y) * w], in + size_t(h - 1 - y) * w, size_t(w) * 4);
+        top = flipped.data();
+    }
+    SDL_Surface* src = SDL_CreateRGBSurfaceWithFormatFrom(const_cast<void*>(top), w, h, 32, w * 4, SDL_PIXELFORMAT_ARGB8888);
+    if (!src) return 0;
+    SDL_FillRect(screen, nullptr, SDL_MapRGB(screen->format, 0, 0, 0));
+    const float scale = std::min(float(screen->w) / float(srcW > 0 ? srcW : w), float(screen->h) / float(srcH > 0 ? srcH : h));
+    SDL_Rect dst{ 0, 0, int(w * scale), int(h * scale) };
+    dst.x = (screen->w - dst.w) / 2; dst.y = (screen->h - dst.h) / 2;
+    SDL_Rect from{ 0, 0, w, h };
+    SDL_BlitScaled(src, &from, screen, &dst);
+    SDL_FreeSurface(src);
+    SDL_UpdateWindowSurface(win);
+    return h;
+}
+extern "C" int StretchDIBits(HDC dc, int, int, int, int, int, int, int sw, int sh, const void* bits, const BITMAPINFO* bmi, UINT, DWORD)
+{
+    return BlitDib(dc, sw, sh, bits, bmi);
+}
+extern "C" int SetDIBitsToDevice(HDC dc, int, int, DWORD w, DWORD h, int, int, UINT, UINT, const void* bits, const BITMAPINFO* bmi, UINT)
+{
+    return BlitDib(dc, int(w), int(h), bits, bmi);
+}
 
 // ---- rectangles ----
 extern "C" BOOL IntersectRect(LPRECT d, const RECT* a, const RECT* b)
