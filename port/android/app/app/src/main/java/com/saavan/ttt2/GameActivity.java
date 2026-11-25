@@ -18,6 +18,8 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected String[] getArguments() {
+        if (getSharedPreferences("ttt2", MODE_PRIVATE).getBoolean("fbdump", false))
+            return new String[] { "--root", LauncherActivity.dataRoot(this), "--fbdump" };
         return new String[] { "--root", LauncherActivity.dataRoot(this) };
     }
 

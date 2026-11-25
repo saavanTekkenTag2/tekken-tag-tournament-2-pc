@@ -158,8 +158,15 @@ extern "C" int SDL_main(int argc, char* argv[])
 {
     std::string root;
     if (const char* r = std::getenv("TTT2_ROOT"); r && *r) root = r;
-    for (int i = 1; i + 1 < argc; ++i)
-        if (std::strcmp(argv[i], "--root") == 0) root = argv[i + 1];
+    bool fbdump = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (i + 1 < argc && std::strcmp(argv[i], "--root") == 0) root = argv[i + 1];
+        if (std::strcmp(argv[i], "--fbdump") == 0) fbdump = true;
+    }
+    // Launcher "Debug: save frames": the rendered frame and the window's back buffer as BMPs once a
+    // second (gpu_hw_d3d11.h TTT2_FB_NATIVE) in <root>/ttt2/port, shown by the launcher's Frames button.
+    if (fbdump) setenv("TTT2_FB_NATIVE", "1", 1);
 #ifdef __ANDROID__
     if (root.empty() && SDL_AndroidGetExternalStorageState() & SDL_ANDROID_EXTERNAL_STORAGE_WRITE)
         if (const char* e = SDL_AndroidGetExternalStoragePath()) root = e;
@@ -169,6 +176,7 @@ extern "C" int SDL_main(int argc, char* argv[])
     while (root.size() > 1 && root.back() == '/') root.pop_back();
     MakeDirs(root + "/TTT2Recomp");
     MakeDirs(root + "/tmp");
+    MakeDirs(root + "/ttt2/port");     // the PC build's diagnostics folder (C:/ttt2/port): frame dumps land here
     if (chdir(root.c_str()) != 0) std::fprintf(stderr, "[android] chdir %s failed (%d)\n", root.c_str(), errno);
 
     auto setDefault = [](const char* name, const std::string& value) { setenv(name, value.c_str(), 0); };
@@ -206,6 +214,7 @@ extern "C" int SDL_main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--root") == 0) { ++i; continue; }
+        if (std::strcmp(argv[i], "--fbdump") == 0) continue;
         args.push_back(argv[i]);
     }
     args.push_back(nullptr);

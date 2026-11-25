@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -19,15 +20,19 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.util.regex.Pattern;
 
 /**
  * Launcher and installer. The player picks their own Tekken Tag Tournament 2 disc image and the
@@ -167,6 +172,22 @@ public class LauncherActivity extends Activity {
         row4.addView(log, lpp);
         col.addView(row4, lp(18));
 
+        LinearLayout row5 = new LinearLayout(this);
+        row5.setOrientation(LinearLayout.HORIZONTAL);
+        row5.setGravity(Gravity.CENTER_VERTICAL);
+        CheckBox fb = new CheckBox(this);
+        fb.setText("Debug: save frames (slower)");
+        fb.setTextColor(Color.LTGRAY);
+        fb.setChecked(prefs.getBoolean("fbdump", false));
+        fb.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("fbdump", on).apply());
+        row5.addView(fb);
+        Button frames = button("Frames", Color.rgb(60, 60, 60));
+        frames.setOnClickListener(v -> showFrames());
+        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        fp.leftMargin = dp(18);
+        row5.addView(frames, fp);
+        col.addView(row5, lp(10));
+
         info = label("", 12, Color.GRAY);
         col.addView(info, lp(14));
 
@@ -267,6 +288,79 @@ public class LauncherActivity extends Activity {
         }
     }
 
+    private static final Pattern KEY = Pattern.compile(
+        "err:|warn:|error|Error|FAILED|failed|\\[android\\]|\\[gpu-hw\\] (present|device|adapter|shader)|presenting through|cannot|\\[path\\]|D3DCompile|vkd3d|Vulkan|DXVK");
+
+    /** The first 60 lines of log.txt and up to 150 important lines (errors, renderer setup) from its first 4 MB. */
+    private static String keyLines(File f) {
+        if (!f.isFile()) return null;
+        StringBuilder head = new StringBuilder("===== log.txt (start) =====\n");
+        StringBuilder key = new StringBuilder("===== log.txt (important lines) =====\n");
+        int n = 0, k = 0;
+        long bytes = 0;
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"))) {
+            String line;
+            while ((line = r.readLine()) != null && bytes < 4_000_000) {
+                bytes += line.length() + 1;
+                if (n++ < 60) head.append(line).append('\n');
+                else if (k < 150 && KEY.matcher(line).find()) { key.append(line).append('\n'); k++; }
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        return head.append('\n').append(key).append('\n').toString();
+    }
+
+    /** BMP (32-bit, as gpu_hw_d3d11.h WriteBmp writes it: top-down when the height is negative) to a Bitmap. */
+    private static Bitmap readBmp(File f) {
+        try (InputStream in = new FileInputStream(f)) {
+            byte[] h = new byte[54];
+            if (in.read(h) != 54 || h[0] != 'B' || h[1] != 'M') return null;
+            int w = (h[18] & 255) | (h[19] & 255) << 8 | (h[20] & 255) << 16 | h[21] << 24;
+            int hh = (h[22] & 255) | (h[23] & 255) << 8 | (h[24] & 255) << 16 | h[25] << 24;
+            boolean topDown = hh < 0;
+            int ht = Math.abs(hh);
+            if (w <= 0 || ht <= 0 || w > 8192 || ht > 8192) return null;
+            byte[] px = new byte[w * ht * 4];
+            int got = 0;
+            while (got < px.length) { int r = in.read(px, got, px.length - got); if (r < 0) break; got += r; }
+            int[] argb = new int[w * ht];
+            for (int y = 0; y < ht; y++) {
+                int row = topDown ? y : ht - 1 - y;
+                for (int x = 0; x < w; x++) {
+                    int i = (row * w + x) * 4;
+                    argb[y * w + x] = 0xFF000000 | (px[i + 2] & 255) << 16 | (px[i + 1] & 255) << 8 | (px[i] & 255);
+                }
+            }
+            return Bitmap.createBitmap(argb, w, ht, Bitmap.Config.ARGB_8888);
+        } catch (Exception | OutOfMemoryError e) {
+            return null;
+        }
+    }
+
+    /** Debug: the game's rendered frame (fb_native.bmp) and the window's back buffer (fb_back.bmp). */
+    private void showFrames() {
+        File dir = new File(dataRoot(this), "ttt2/port");
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(10), dp(10), dp(10), dp(10));
+        for (String name : new String[] { "fb_native.bmp", "fb_back.bmp" }) {
+            File f = new File(dir, name);
+            col.addView(label(name + (f.isFile() ? "  (" + f.length() / 1024 + " KB, " + new java.util.Date(f.lastModified()) + ")" : "  - not saved yet"), 13, Color.WHITE));
+            Bitmap b = f.isFile() ? readBmp(f) : null;
+            if (b != null) {
+                ImageView iv = new ImageView(this);
+                iv.setImageBitmap(b);
+                iv.setAdjustViewBounds(true);
+                col.addView(iv, lp(4));
+            }
+        }
+        col.addView(label("Turn on \"Debug: save frames\", PLAY for 20 seconds, come back here.", 12, Color.GRAY), lp(8));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(col);
+        new AlertDialog.Builder(this).setTitle("Frames").setView(sv).setNegativeButton("Close", null).show();
+    }
+
     /** crash.txt (if the last start crashed), log_start.txt, the end of log.txt, the DXVK logs. */
     private void showLog() {
         File dir = new File(dataRoot(this), "TTT2Recomp");
@@ -275,7 +369,9 @@ public class LauncherActivity extends Activity {
         if (crash != null && !crash.isEmpty()) sb.append("===== crash.txt =====\n").append(crash).append("\n");
         String start = tail(new File(dir, "log_start.txt"), 4_000);
         if (start != null) sb.append("===== log_start.txt =====\n").append(start).append("\n");
-        String log = tail(new File(dir, "log.txt"), 150_000);
+        String key = keyLines(new File(dir, "log.txt"));
+        if (key != null) sb.append(key);
+        String log = tail(new File(dir, "log.txt"), 60_000);
         sb.append("===== log.txt (end) =====\n").append(log != null ? log : "no log yet (" + dir + "/log.txt)").append("\n");
         File[] others = dir.listFiles((d, name) -> name.endsWith(".log"));
         if (others != null)
