@@ -9,6 +9,13 @@ PATCHES = [
     ("src/util/util_bit.h",
      '    #elif defined(__GNUC__) || defined(__clang__)\n    uint32_t res;\n    uint32_t tmp;\n    asm (',
      '    #elif (defined(__GNUC__) || defined(__clang__)) && !defined(__x86_64__) && !defined(__i386__)\n    return n != 0 ? uint32_t(__builtin_ctz(n)) : 32u;\n    #elif defined(__GNUC__) || defined(__clang__)\n    uint32_t res;\n    uint32_t tmp;\n    asm ('),
+    # Android returns VK_SUBOPTIMAL_KHR from every present when the swap chain is not in the
+    # display's own orientation (a landscape game on a portrait panel: the compositor rotates).
+    # The image is still shown; recreating the swap chain on it rebuilt it every frame (log full
+    # of "Actual swap chain properties", black screen). Only real errors recreate it now.
+    ("src/d3d11/d3d11_swapchain.cpp",
+     '    VkResult status = m_device->waitForSubmission(&m_presentStatus);\n    \n    if (status != VK_SUCCESS)\n      RecreateSwapChain(m_vsync);',
+     '    VkResult status = m_device->waitForSubmission(&m_presentStatus);\n    \n    if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)\n      RecreateSwapChain(m_vsync);'),
 ]
 
 def apply(rel, old, new):

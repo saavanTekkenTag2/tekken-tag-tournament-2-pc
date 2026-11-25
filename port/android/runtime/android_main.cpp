@@ -184,7 +184,7 @@ extern "C" int SDL_main(int argc, char* argv[])
     setDefault("TTT2_SAVE_ROOT", root + "/TTT2Recomp/saves");
     // DXVK (D3D11 -> Vulkan): its log and pipeline state cache next to the game's log
     setDefault("DXVK_LOG_PATH", root + "/TTT2Recomp");
-    setDefault("DXVK_LOG_LEVEL", "info");
+    setDefault("DXVK_LOG_LEVEL", "warn");
     setDefault("DXVK_STATE_CACHE_PATH", root + "/TTT2Recomp");
     setDefault("DXVK_HUD", "0");
     // The log is written directly, not through the PC build's pipe + writer thread: a crash right
