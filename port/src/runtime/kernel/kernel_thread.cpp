@@ -240,26 +240,22 @@ uint32_t CurrentGuestEntry() { return t_contextSlot ? t_contextSlot->entry : 0; 
 PPCContext* CurrentGuestContext() { return t_contextSlot ? t_contextSlot->ctx : nullptr; }
 
 // [mv] trace (Android 2026-11-25: the game froze for good after the opening movie was skipped - the main thread in
-// KeWait at 8277F090 while the next movie's player came up with two of its threads, not three). From the moment the
-// first XMV player thread (entries 8277D9F8..8277DA88) ends, every kernel import called on a movie player thread, or
-// from the movie code (lr 82770000..8278FFFF) on any thread, goes to the log with its caller and arguments - the first
-// 3000. TTT2_MOVIE_TRACE=0: off; =1: from the start.
+// KeWait at 8277F090 while the next movie's player ran two of its four threads; the other two, created suspended, were
+// never resumed). Every kernel import called on a movie player thread (entries 8277D9F8..8277DA88), or from the movie
+// code (lr 82770000..8278FFFF) on any thread, goes to the log with its caller and arguments, from the start - except
+// the lock and allocation calls, and at most 6 lines per (import, caller, first argument) before every 500th. 6000
+// lines in all. NtResumeThread / NtSuspendThread calls are logged whoever makes them (the first 400). TTT2_MOVIE_TRACE=0: off.
 static std::atomic<int> g_movieTraceArmed{ -1 };
 static bool MovieEntry(uint32_t e) { return e >= 0x8277D9F8u && e <= 0x8277DA88u; }
-static void MovieTraceArm(const char* why)
-{
-    int expect = 0;
-    if (g_movieTraceArmed.compare_exchange_strong(expect, 1))
-        std::fprintf(stderr, "[mv] trace armed: %s\n", why);
-}
+static bool MovieTraceOn();
+static void MovieTraceArm(const char* why) { if (MovieTraceOn()) std::fprintf(stderr, "[mv] %s\n", why); }
 static bool MovieTraceOn()
 {
     int v = g_movieTraceArmed.load(std::memory_order_relaxed);
     if (v < 0)
     {
         const char* e = std::getenv("TTT2_MOVIE_TRACE");
-        const int want = e && e[0] == '0' ? 2 : e && e[0] == '1' ? 1 : 0;   // 2: never
-        g_movieTraceArmed.compare_exchange_strong(v, want);
+        g_movieTraceArmed.compare_exchange_strong(v, e && e[0] == '0' ? 2 : 1);
         v = g_movieTraceArmed.load(std::memory_order_relaxed);
     }
     return v == 1;
@@ -271,12 +267,24 @@ void MovieTraceNote(const char* name)
     if (!ctx) return;
     const uint32_t entry = t_contextSlot->entry, lr = uint32_t(ctx->lr);
     if (!MovieEntry(entry) && !(lr >= 0x82770000u && lr < 0x82790000u)) return;
+    if (std::strstr(name, "CriticalSection") || std::strstr(name, "VirtualMemory") || std::strstr(name, "PerformanceCounter") ||
+        std::strstr(name, "QuerySystemTime") || std::strstr(name, "TlsGetValue") || std::strstr(name, "GetCurrentProcessorNumber"))
+        return;
+    static std::mutex m;
+    static std::unordered_map<uint64_t, uint32_t> seen;
+    uint32_t count;
+    {
+        std::lock_guard lk(m);
+        const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(name) & 0xFFFF) << 48) ^ (uint64_t(lr) << 16) ^ ctx->r3.u32 ^ (uint64_t(ctx->r3.u32) << 32);
+        count = ++seen[key];
+    }
+    if (count > 6 && count % 500 != 0) return;
     static std::atomic<int> lines{ 0 };
     const int n = lines.fetch_add(1, std::memory_order_relaxed);
-    if (n >= 3000) return;
-    std::fprintf(stderr, "[mv] %lu e=%08X %s lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X%s\n",
+    if (n >= 6000) return;
+    std::fprintf(stderr, "[mv] %lu e=%08X %s lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X%s%s\n",
                  (unsigned long)GetCurrentThreadId(), entry, name, lr, ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r6.u32,
-                 ctx->r7.u32, ctx->r8.u32, n == 2999 ? " (the last [mv] line)" : "");
+                 ctx->r7.u32, ctx->r8.u32, count > 6 ? " (repeated)" : "", n == 5999 ? " (the last [mv] line)" : "");
 }
 
 // TTT2_WTRACE=1: log the guest caller (lr) of wait/sleep primitives to find spin loops.
@@ -777,6 +785,12 @@ PPC_FUNC(__imp__ExCreateThread)
 
     GWrite32(base, handlePtr, KernelObjectHandle(obj));
     if (threadIdPtr) GWrite32(base, threadIdPtr, threadId);
+    if (MovieEntry(startAddress) || MovieTraceOn())
+    {
+        static std::atomic<int> handleLogs{ 0 };
+        if (handleLogs.fetch_add(1, std::memory_order_relaxed) < 200)
+            std::fprintf(stderr, "[mv] ExCreateThread start=%08X -> handle %08X%s\n", startAddress, KernelObjectHandle(obj), suspended ? " (suspended)" : "");
+    }
     ctx.r3.u32 = STATUS_SUCCESS;
 }
 
@@ -786,12 +800,20 @@ PPC_FUNC(__imp__NtResumeThread)
     KTrace("NtResumeThread");
     uint32_t previous = 0;
     const auto status = KernelResumeThread(ctx.r3.u32, &previous);
+    if (MovieTraceOn())
+    {
+        static std::atomic<int> resumeLogs{ 0 };
+        if (resumeLogs.fetch_add(1, std::memory_order_relaxed) < 400)
+            std::fprintf(stderr, "[mv] NtResumeThread h=%08X -> %08X (previous count %u) lr=%08X thread %lu entry %08X\n", ctx.r3.u32, status,
+                         previous, uint32_t(ctx.lr), (unsigned long)GetCurrentThreadId(), CurrentGuestEntry());
+    }
     if (status == STATUS_SUCCESS && ctx.r4.u32) GWrite32(base, ctx.r4.u32, previous);
     ctx.r3.u32 = status;
 }
 PPC_FUNC(__imp__NtSuspendThread)
 {
     KTrace("NtSuspendThread");
+    if (MovieTraceOn()) std::fprintf(stderr, "[mv] NtSuspendThread h=%08X lr=%08X thread %lu\n", ctx.r3.u32, uint32_t(ctx.lr), (unsigned long)GetCurrentThreadId());
     if (WTrace()) std::fprintf(stderr, "[w] NtSuspendThread h=%08X lr=%08X\n", ctx.r3.u32, (uint32_t)ctx.lr);
     uint32_t previous = 0;
     const auto status = KernelSuspendThread(ctx.r3.u32, &previous);
