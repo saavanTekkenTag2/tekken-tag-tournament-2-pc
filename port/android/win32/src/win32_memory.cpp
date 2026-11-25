@@ -11,6 +11,8 @@
 // AddVectoredExceptionHandler (the runtime's copy-on-write, physical-mirror and guard
 // handlers), in registration order. On Android, ART's libsigchain sees the signal first
 // and passes on what is not its own.
+#include <cstdio>
+#include <atomic>
 #include "win32_internal.h"
 
 #include <algorithm>
@@ -441,6 +443,29 @@ void Handler(int sig, siginfo_t* info, void* uctx)
                     errno = savedErrno;
                     return;
                 }
+                // Another thread took the same write-watch fault first and has already opened the page (two
+                // threads writing one armed page at once - the job workers filling textures during a stage load):
+                // the page now allows this access, so retry it. Windows tracks write watch in the kernel and never
+                // faults; here the loser of the race fell through to the vectored handlers and the game died
+                // (MEASURED 2026-11-25: SIGSEGV writing guest B42EE088 on a job worker at the first stage load).
+                if ((f & P_COMMITTED) && !(f & P_GUARD))
+                {
+                    const int now = EffectiveProt(r, page);
+                    const bool write = WriteFault(uc, sig);
+                    if (write ? (now & PROT_WRITE) : (now & PROT_READ))
+                    {
+                        static thread_local uintptr_t lastAddr = 0;
+                        static thread_local int repeats = 0;
+                        repeats = addr == lastAddr ? repeats + 1 : 0;
+                        lastAddr = addr;
+                        if (repeats < 8)
+                        {
+                            Apply(r, page, page + 1);   // the host protection matches the bookkeeping again
+                            errno = savedErrno;
+                            return;
+                        }
+                    }
+                }
                 if (f & P_GUARD)
                 {
                     f &= uint8_t(~P_GUARD);
@@ -458,6 +483,18 @@ void Handler(int sig, siginfo_t* info, void* uctx)
                     for (int i = 0; i < n; ++i) if (g_veh[i] && g_veh[i](&ep) == EXCEPTION_CONTINUE_EXECUTION) break;
                     errno = savedErrno;
                     return;   // guard semantics: one-shot, the access is retried either way
+                }
+                // Not ours to settle: say what the page looked like (the vectored handlers decide next).
+                static std::atomic<int> notes{ 0 };
+                if (notes.fetch_add(1, std::memory_order_relaxed) < 20)
+                {
+                    char line[192];
+                    const int n = std::snprintf(line, sizeof(line),
+                        "[mem] fault %s at %p in a region (base %p): page flags %02X (committed %d dirty %d armed %d guard %d), protect %02X, watch %d, host prot %d\n",
+                        WriteFault(uc, sig) ? "write" : "read", reinterpret_cast<void*>(addr), reinterpret_cast<void*>(r->base), f,
+                        (f & P_COMMITTED) ? 1 : 0, (f & P_DIRTY) ? 1 : 0, (f & P_ARMED) ? 1 : 0, (f & P_GUARD) ? 1 : 0,
+                        r->prot[page], r->watch ? 1 : 0, EffectiveProt(r, page));
+                    if (n > 0) { const ssize_t w = write(2, line, size_t(n)); (void)w; }
                 }
             }
         }
