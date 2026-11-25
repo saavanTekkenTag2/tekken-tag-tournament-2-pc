@@ -474,14 +474,65 @@ uint32_t g_nextHandle = 0xF0000000;
 std::mutex g_gdMutex;
 std::unordered_map<uint32_t, KObject*> g_guestObjects;
 
+// A KEVENT the game builds again where an older one was (a freed and reallocated heap object: the XMV movie player
+// skipped with START, then the next movie) is initialized inline - Type, SignalState and an empty wait list
+// (WaitListHead +8/+C pointing at itself) - with no kernel call. The host event bound to that address held the old
+// event's state, so the new player waited for good on a host event that would never be set (Android 2026-11-25: the
+// main thread in KeWait at 8277F090 after skipping the opening movie). A bound header gets its wait list pointed at
+// the header itself (no guest code walks it: the waits are the host's); a header whose list points at +8 again was
+// initialized anew, and gets a new host event with its own type and state. The old host object is leaked, not
+// deleted: a waiter that still holds it never touches freed memory. TTT2_EVENT_REINIT=0: the old binding for good.
+static bool EventReinitOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_EVENT_REINIT"); return !(e && e[0] == '0'); }();
+    return on;
+}
+static void MarkBoundHeader(uint8_t* base, uint32_t addr)
+{
+    if (!EventReinitOn()) return;
+    if (GRead32(base, addr + 8) != addr) GWrite32(base, addr + 8, addr);
+    if (GRead32(base, addr + 12) != addr) GWrite32(base, addr + 12, addr);
+}
 KEvent* QueryGuestEvent(uint8_t* base, uint32_t addr)
 {
     std::lock_guard lk(g_gdMutex);
-    auto it = g_guestObjects.find(addr);
-    if (it != g_guestObjects.end()) return static_cast<KEvent*>(it->second);
     uint8_t type = GRead8(base, addr);               // dispatcher Type: 0=notification(manual),1=sync(auto)
+    auto it = g_guestObjects.find(addr);
+    if (it != g_guestObjects.end())
+    {
+        if (!EventReinitOn() || GRead32(base, addr + 8) != addr + 8 || GRead32(base, addr + 12) != addr + 8)
+            return static_cast<KEvent*>(it->second);
+        const bool signalled = GRead32(base, addr + 4) != 0;
+        auto* old = static_cast<KEvent*>(it->second);
+        bool inPlace = false;
+        {
+            // Nobody waiting on it: the same host object takes the new type and state (no leak for events a function
+            // builds on its stack each call). Waiters queued: they keep the old object and the address a new one.
+            std::lock_guard elk(old->m);
+            if (old->queue.empty() && old->granted.empty())
+            {
+                old->manualReset = type == 0;
+                old->state = signalled;
+                old->pulseAvailable = false;
+                inPlace = true;
+                if (signalled) old->DispatcherChanged();   // under m (every object's m is g_dispatchMutex)
+            }
+        }
+        if (inPlace && signalled) old->cv.notify_all();
+        static std::atomic<int> reinitLogs{ 0 };
+        if (reinitLogs.fetch_add(1, std::memory_order_relaxed) < 40)
+            std::fprintf(stderr, "[event] KEVENT at %08X initialized again by the game (type %u, signalled %u): %s\n",
+                         addr, type, signalled ? 1u : 0u, inPlace ? "its host event reset" : "a new host event (waiters on the old one)");
+        if (inPlace)
+        {
+            MarkBoundHeader(base, addr);
+            return old;
+        }
+        g_guestObjects.erase(it);
+    }
     auto* e = new KEvent(type == 0, GRead32(base, addr + 4) != 0);
     g_guestObjects[addr] = e;
+    MarkBoundHeader(base, addr);
     return e;
 }
 
