@@ -555,8 +555,18 @@ public:
             out << "        float4 f = " << (cube ? "XExactSampleA(" : "XExactSample(") << t << ", uv, "
                 << (cube ? "face, " : "") << "texInfo[" << slot << "].zw, smp);\n";
         else if (cube)
+        {
+#ifdef __ANDROID__
+            // vkd3d-shader's HLSL compiler (Android) sizes SampleGrad's gradients by the coordinate's dimension,
+            // array index included: a Texture2DArray takes float3 gradients there (float2 in Microsoft's HLSL).
+            // With float2 every cube-capable pixel shader with computed LOD failed to compile ("Can't implicitly
+            // convert from float2 to float3", then a cascade on PSIn's a[16]) and its draws were skipped - the
+            // characters' and the floor's missing parts (46 of 46 saved failures compile with this, 2026-11-25).
+            if (grad) tail = ", float3(gx, 0), float3(gy, 0));\n";
+#endif
             out << "        float4 f = " << t << op << (slot & 15) << "], float3(XNativeUV(uv, smp, texScale["
                 << slot << "]), face)" << tail;
+        }
         else
             out << "        float4 f = " << t << op << (slot & 15) << "], XNativeUV(uv, smp, texScale["
                 << slot << "])" << tail;
