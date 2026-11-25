@@ -7,12 +7,16 @@
 //   4 draw, texel from a texture   shader resources (Load)
 //   5 draw, sampled texture        samplers
 //   6 draw into a B8G8R8A8 target  the format the game presents from
+//   7 draw with DepthClipEnable = FALSE (the game's own rasterizer states): a) as DXVK is, b) with the
+//     Android depth-clip workaround (DXVK_ANDROID_FORCE_DEPTH_CLIP)
+//   8 uint target, nointerpolation uint varyings (the runtime's constant-ring self-test shape)
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
 #include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -88,7 +92,8 @@ const char* kVs =
 
 // Draws a full-screen triangle with the pixel shader into a fresh 2x2 target (cleared to grey first).
 bool Draw(Ctx& c, const char* ps, DXGI_FORMAT fmt, uint32_t& got,
-          ID3D11Buffer* cb = nullptr, ID3D11ShaderResourceView* srv = nullptr, ID3D11SamplerState* smp = nullptr)
+          ID3D11Buffer* cb = nullptr, ID3D11ShaderResourceView* srv = nullptr, ID3D11SamplerState* smp = nullptr,
+          bool depthClip = true)
 {
     auto vsCode = Compile(kVs, "vs_5_0");
     auto psCode = Compile(ps, "ps_5_0");
@@ -109,7 +114,7 @@ bool Draw(Ctx& c, const char* ps, DXGI_FORMAT fmt, uint32_t& got,
     const D3D11_VIEWPORT vp{ 0, 0, 2, 2, 0, 1 };
     c.ctx->RSSetViewports(1, &vp);
     D3D11_RASTERIZER_DESC rd{};
-    rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
+    rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = depthClip ? TRUE : FALSE;
     ComPtr<ID3D11RasterizerState> rs;
     c.dev->CreateRasterizerState(&rd, &rs);
     c.ctx->RSSetState(rs.Get());
@@ -205,6 +210,61 @@ extern "C" void Ttt2GpuSelfTest(const char* root)
     {
         bool ran = Draw(c, "float4 main(float4 p : SV_Position) : SV_Target { return float4(1, 0, 1, 1); }", DXGI_FORMAT_B8G8R8A8_UNORM, got);
         Check("6 draw magenta into B8G8R8A8", ran, got, 0xFF00FFFFu, failed);
+    }
+    // 7: depth clip off, without and with the workaround (DXVK reads the variable when a rasterizer state is made)
+    {
+        const char* green = "float4 main(float4 p : SV_Position) : SV_Target { return float4(0, 1, 0, 1); }";
+        setenv("DXVK_ANDROID_FORCE_DEPTH_CLIP", "0", 1);
+        bool ran = Draw(c, green, DXGI_FORMAT_R8G8B8A8_UNORM, got, nullptr, nullptr, nullptr, false);
+        int ignored = 0;
+        Check("7a depth clip off (DXVK as is)", ran, got, 0x00FF00FFu, ignored);
+        Log("     -> %s\n", ran && got == 0x00FF00FFu ? "this GPU draws without depth clip" : "this GPU drops draws without depth clip: the workaround is needed");
+        setenv("DXVK_ANDROID_FORCE_DEPTH_CLIP", "1", 1);
+        ran = Draw(c, green, DXGI_FORMAT_R8G8B8A8_UNORM, got, nullptr, nullptr, nullptr, false);
+        Check("7b depth clip off (workaround on)", ran, got, 0x00FF00FFu, failed);
+    }
+    // 8: uint render target + nointerpolation uint varyings
+    {
+        auto vsCode = Compile("struct V { float4 pos : SV_Position; nointerpolation uint4 v : TEXCOORD0; };"
+                              "V main(uint id : SV_VertexID) { V o; float2 p = float2((id << 1) & 2, id & 2);"
+                              " o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.v = uint4(11, 22, 33, 44); return o; }", "vs_5_0");
+        auto psCode = Compile("struct V { float4 pos : SV_Position; nointerpolation uint4 v : TEXCOORD0; };"
+                              "uint4 main(V i) : SV_Target { return i.v; }", "ps_5_0");
+        bool ran = false;
+        uint32_t u[4] = {};
+        ComPtr<ID3D11VertexShader> vs; ComPtr<ID3D11PixelShader> ps;
+        if (vsCode && psCode && SUCCEEDED(c.dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs)) &&
+            SUCCEEDED(c.dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps)))
+        {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = 2; td.Height = 1; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_R32G32B32A32_UINT; td.SampleDesc.Count = 1;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET;
+            ComPtr<ID3D11Texture2D> t, st; ComPtr<ID3D11RenderTargetView> rtv;
+            c.dev->CreateTexture2D(&td, nullptr, &t);
+            td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            c.dev->CreateTexture2D(&td, nullptr, &st);
+            if (t && st && SUCCEEDED(c.dev->CreateRenderTargetView(t.Get(), nullptr, &rtv)))
+            {
+                D3D11_RASTERIZER_DESC rd{};
+                rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
+                ComPtr<ID3D11RasterizerState> rs; c.dev->CreateRasterizerState(&rd, &rs);
+                c.ctx->ClearState();
+                c.ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                const D3D11_VIEWPORT vp{ 0, 0, 2, 1, 0, 1 };
+                c.ctx->RSSetViewports(1, &vp);
+                c.ctx->RSSetState(rs.Get());
+                c.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                c.ctx->VSSetShader(vs.Get(), nullptr, 0);
+                c.ctx->PSSetShader(ps.Get(), nullptr, 0);
+                c.ctx->Draw(3, 0);
+                c.ctx->CopyResource(st.Get(), t.Get());
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (SUCCEEDED(c.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) { std::memcpy(u, m.pData, 16); c.ctx->Unmap(st.Get(), 0); ran = true; }
+            }
+        }
+        const bool ok = ran && u[0] == 11 && u[1] == 22 && u[2] == 33 && u[3] == 44;
+        if (!ok) ++failed;
+        Log("  %-34s %s  got %u %u %u %u want 11 22 33 44\n", "8 uint target, nointerpolation", ok ? "OK  " : "FAIL", u[0], u[1], u[2], u[3]);
     }
     Log("[gpu-selftest] %s (%d failed)\n", failed ? "FAILED" : "all passed", failed);
     if (g_out) std::fclose(g_out);

@@ -16,6 +16,12 @@ PATCHES = [
     ("src/d3d11/d3d11_swapchain.cpp",
      '    VkResult status = m_device->waitForSubmission(&m_presentStatus);\n    \n    if (status != VK_SUCCESS)\n      RecreateSwapChain(m_vsync);',
      '    VkResult status = m_device->waitForSubmission(&m_presentStatus);\n    \n    if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)\n      RecreateSwapChain(m_vsync);'),
+    # Adreno: a rasterizer state with DepthClipEnable = FALSE (depth clamp on, depth clip off) drew
+    # nothing at all on the device - the game's own states and its present use it, so the whole frame
+    # stayed black while simple tests passed. Depth clip stays on unless DXVK_ANDROID_FORCE_DEPTH_CLIP=0.
+    ("src/d3d11/d3d11_rasterizer.cpp",
+     '    m_state.depthClipEnable   = desc.DepthClipEnable;',
+     '    m_state.depthClipEnable   = desc.DepthClipEnable || [] { const char* e = std::getenv("DXVK_ANDROID_FORCE_DEPTH_CLIP"); return !(e && e[0] == \'0\'); }();'),
 ]
 
 def apply(rel, old, new):
