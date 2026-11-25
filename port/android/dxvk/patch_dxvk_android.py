@@ -22,6 +22,33 @@ PATCHES = [
     ("src/d3d11/d3d11_rasterizer.cpp",
      '    m_state.depthClipEnable   = desc.DepthClipEnable;',
      '    m_state.depthClipEnable   = desc.DepthClipEnable || [] { const char* e = std::getenv("DXVK_ANDROID_FORCE_DEPTH_CLIP"); return !(e && e[0] == \'0\'); }();'),
+    # Adreno: DXVK asked for DenormFlushToZero on 32-bit floats (the D3D11 rule). DXVK and vkd3d move
+    # integers through float registers as bit patterns; small integers are denormal floats, so on
+    # Adreno they became 0 (self-test 8c flat uint varying, 16 cbuffer uint4[i][j]) - the game's
+    # uint constants (texture swizzles, vertex fetch descriptors) read as 0 and nothing was drawn.
+    # Denormals are preserved instead (when the driver can), and the driver's support is logged.
+    ("src/dxbc/dxbc_options.h",
+     '    PreserveNan64,\n  };',
+     '    PreserveNan64,\n    DenormPreserve32,\n  };'),
+    ("src/dxbc/dxbc_options.cpp",
+     '        if (devInfo.khrShaderFloatControls.shaderDenormFlushToZeroFloat32)\n          floatControl.set(DxbcFloatControlFlag::DenormFlushToZero32);\n',
+     '        // Android: no DenormFlushToZero32 (it zeroed integers held in float registers on Adreno)\n'),
+    ("src/dxbc/dxbc_options.cpp",
+     '    // Figure out float control flags to match D3D11 rules\n    if (options.floatControls) {',
+     '    // Figure out float control flags to match D3D11 rules\n'
+     '    Logger::warn(str::format("DXBC float controls (Android): denorm independence ", uint32_t(devInfo.khrShaderFloatControls.denormBehaviorIndependence),\n'
+     '      ", preserve32 ", uint32_t(devInfo.khrShaderFloatControls.shaderDenormPreserveFloat32),\n'
+     '      ", ftz32 ", uint32_t(devInfo.khrShaderFloatControls.shaderDenormFlushToZeroFloat32)));\n'
+     '    if (devInfo.khrShaderFloatControls.shaderDenormPreserveFloat32)\n'
+     '      floatControl.set(DxbcFloatControlFlag::DenormPreserve32);\n'
+     '    if (options.floatControls) {'),
+    ("src/dxbc/dxbc_compiler.cpp",
+     '    if (flags.test(DxbcFloatControlFlag::PreserveNan32)) {',
+     '    if (flags.test(DxbcFloatControlFlag::DenormPreserve32)) {\n'
+     '      m_module.enableCapability(spv::CapabilityDenormPreserve);\n'
+     '      m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeDenormPreserve, 1, &width32);\n'
+     '    }\n\n'
+     '    if (flags.test(DxbcFloatControlFlag::PreserveNan32)) {'),
 ]
 
 def apply(rel, old, new):
