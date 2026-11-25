@@ -205,6 +205,9 @@ extern "C" int SDL_main(int argc, char* argv[])
     setDefault("TTT2_GPU_HW", "1");                        // the hardware renderer (D3D11 -> DXVK -> Vulkan)
     setDefault("TTT2_FBDUMP", "0");
     setDefault("TTT2_SAVE_ROOT", root + "/TTT2Recomp/saves");
+    // No sign-in dialog on Android: the last used profile is signed in at start (the save device needs a profile;
+    // with none signed in the game asked for a storage device / to create save data and never got one).
+    setDefault("TTT2_AUTO_SIGNIN", "1");
     // DXVK (D3D11 -> Vulkan): its log and pipeline state cache next to the game's log
     setDefault("DXVK_LOG_PATH", root + "/TTT2Recomp");
     setDefault("DXVK_LOG_LEVEL", "warn");

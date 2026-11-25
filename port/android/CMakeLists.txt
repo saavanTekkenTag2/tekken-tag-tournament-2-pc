@@ -100,7 +100,7 @@ endif()
 add_library(main SHARED ${RUNTIME_SOURCES})
 target_include_directories(main PRIVATE ${WIN32_INCLUDES} "${PORT}/src" "${VKD3D_SOURCE}/include" "${PPC_DIR}" "${XENON_UTILS}" "${SIMDE_DIR}" "${RUNTIME}" "${RUNTIME}/kernel")
 target_compile_definitions(main PRIVATE
-    TTT2_LOCAL_SAVES=0 TTT2_DRAW_CAPTURE_DIAGNOSTICS=1 TTT2_D3D11_MOVIE_BACKEND=1 TTT2_GPU_HW_BACKEND=1 TTT2_HAVE_STEAM=0
+    TTT2_LOCAL_SAVES=1 TTT2_DRAW_CAPTURE_DIAGNOSTICS=1 TTT2_D3D11_MOVIE_BACKEND=1 TTT2_GPU_HW_BACKEND=1 TTT2_HAVE_STEAM=0
     SIMDE_ENABLE_NATIVE_ALIASES)
 set_property(SOURCE "${RUNTIME}/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS TTT2_VERSION_STR="0.2.0-android" main=ttt2_main)
 target_compile_options(main PRIVATE -O2 -include msvc_crt.h -Wno-everything -ffp-contract=off -fno-strict-aliasing -fno-autolink)

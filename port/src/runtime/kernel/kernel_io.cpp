@@ -252,6 +252,37 @@ static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
         directory=(options&1)!=0;
         if(disposition>5 || (options&0x1000)){status=0xC0000002u;stage="options";} // delete-on-close not implemented
         else {
+#ifdef __ANDROID__
+            // Android: no ntdll (NtCreateFile relative to a directory handle) and no reparse points or final-path
+            // normalisation to guard against - the save is opened by its path under the app's own storage, which
+            // ResolveSaveFile built from the mounted container. Same rules otherwise: the container root opens only as
+            // a directory for reading, nested folders are refused, the journal copies a save before a change.
+            // MEASURED 2026-11-25: every save open failed (NtCreateFile not found), the game kept asking for a storage
+            // device / to create save data.
+            if(savePath==container) {
+                if(!directory||disposition!=1||writable){status=0xC0000022u;stage="root-access";}
+                else {
+                    h=CreateFileW(container.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,
+                                  OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+                    if(h==INVALID_HANDLE_VALUE){status=FileErrorStatus(GetLastError());stage="container";}
+                }
+            } else if(directory){status=0xC0000002u;stage="nested";}
+            else {
+                if(writable||disposition==0||disposition==4||disposition==5)SaveJournalBeforeChange(container,savePath);
+                // NT dispositions: 0 supersede, 1 open, 2 create, 3 open-if, 4 overwrite, 5 overwrite-if.
+                static const DWORD kHostDisposition[6]={CREATE_ALWAYS,OPEN_EXISTING,CREATE_NEW,OPEN_ALWAYS,TRUNCATE_EXISTING,CREATE_ALWAYS};
+                const bool existed=GetFileAttributesW(savePath.c_str())!=INVALID_FILE_ATTRIBUTES;
+                const bool wantsWrite=writable||disposition==0||disposition==2||disposition==4||disposition==5||(disposition==3&&!existed);
+                h=CreateFileW(savePath.c_str(),GENERIC_READ|(wantsWrite?GENERIC_WRITE:0),FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                              nullptr,kHostDisposition[disposition],FILE_ATTRIBUTE_NORMAL,nullptr);
+                if(h==INVALID_HANDLE_VALUE){status=FileErrorStatus(GetLastError());stage="host-CreateFileW";}
+                else {
+                    // IO_STATUS_BLOCK.Information: 0 superseded, 1 opened, 2 created, 3 overwritten.
+                    static const uint32_t kExisted[6]={0,1,2,1,3,3};
+                    information=existed?kExisted[disposition]:2u;
+                }
+            }
+#else
             // Open a verified container handle first; the flat child lookup is
             // relative to that handle, not a reparsable parent path.
             HANDLE parent=CreateFileW(container.c_str(),FILE_LIST_DIRECTORY|FILE_TRAVERSE,
@@ -308,6 +339,7 @@ static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
                 }
                 if(parent!=INVALID_HANDLE_VALUE)CloseHandle(parent);
             }
+#endif
         }
     }
     {
