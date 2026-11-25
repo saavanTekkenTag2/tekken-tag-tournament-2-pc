@@ -91,7 +91,8 @@ set(RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/community_tls_android.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/abi_bridges.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/d3dcompile_vkd3d.cpp"      # D3DCompile over vkd3d-shader
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/android_install.cpp")      # disc + TU3 -> game folder (JNI)
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/android_install.cpp"       # disc + TU3 -> game folder (JNI)
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/path_wrap.cpp")            # Windows paths through fopen/open/stat (--wrap below)
 if(NOT TTT2_D3D_LIBS)
     list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/d3d_unavailable.cpp")
 endif()
@@ -106,3 +107,8 @@ target_link_libraries(main PRIVATE tekken_ppc ttt2_ffmpeg ttt2_setup_core ttt2_w
 # #pragma comment(lib, "ws2_32.lib") & co. become ELF dependent-library records: ignore them.
 target_link_options(main PRIVATE -Wl,--gc-sections -Wl,--no-undefined -Wl,--no-dependent-libraries -Wl,-z,max-page-size=16384 "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libmain.map")
 set_property(TARGET main APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/libmain.map")
+# C library calls with Windows paths ("C:\\game\\tekken.img" from std::ifstream, fopen, std::filesystem) are mapped
+# like CreateFile's: runtime/path_wrap.cpp.
+foreach(fn fopen freopen open __open_2 stat lstat access mkdir opendir remove unlink rmdir rename truncate statvfs realpath)
+    target_link_options(main PRIVATE "-Wl,--wrap=${fn}")
+endforeach()
