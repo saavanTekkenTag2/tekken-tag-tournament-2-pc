@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -210,6 +212,23 @@ extern "C" HANDLE CreateFileA(LPCSTR name, DWORD access, DWORD, LPSECURITY_ATTRI
     if (!name || !*name) { SetLastError(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
     if (strcasecmp(name, "NUL") == 0 || strcasecmp(name, "\\\\.\\NUL") == 0) return OpenHost("/dev/null", access, OPEN_EXISTING, 0);
     if (strcasecmp(name, "CONOUT$") == 0) return OpenHost("/dev/stderr", GENERIC_WRITE, OPEN_EXISTING, 0);
+    // Files picked with Android's file picker arrive as /proc/self/fd/<n>. Reopening that path
+    // goes through the storage FUSE mount, which refuses apps without storage permission, so the
+    // already-open descriptor is duplicated instead (reads use pread or their own offset).
+    if (std::strncmp(name, "/proc/self/fd/", 14) == 0 && disposition == OPEN_EXISTING)
+    {
+        char* end = nullptr;
+        const long n = std::strtol(name + 14, &end, 10);
+        if (end && *end == '\0' && n >= 0)
+        {
+            const int fd = fcntl(int(n), F_DUPFD_CLOEXEC, 0);
+            if (fd < 0) { SetErrno(errno); return INVALID_HANDLE_VALUE; }
+            lseek(fd, 0, SEEK_SET);
+            auto* f = new File(); f->fd = fd; f->path = name;
+            SetLastError(0);
+            return Wrap(f);
+        }
+    }
     return OpenHost(HostPath(name, disposition == OPEN_EXISTING || disposition == TRUNCATE_EXISTING), access, disposition, flags);
 }
 extern "C" HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE t)

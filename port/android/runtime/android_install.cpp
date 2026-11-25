@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -68,7 +69,11 @@ bool OpenTitleUpdate(const std::string& path, StfsPackage& pkg, std::vector<uint
 {
     std::vector<std::string> candidates;
     struct stat st{};
-    if (stat(path.c_str(), &st) != 0) { why = "The title update file was not found."; return false; }
+    // /proc/self/fd/<n> (Android file picker): fstat the open descriptor, the path itself may be refused.
+    int rc;
+    if (path.rfind("/proc/self/fd/", 0) == 0) rc = fstat(std::atoi(path.c_str() + 14), &st);
+    else rc = stat(path.c_str(), &st);
+    if (rc != 0) { why = "The title update file was not found."; return false; }
     if (S_ISDIR(st.st_mode))
     {
         WIN32_FIND_DATAA fd;
