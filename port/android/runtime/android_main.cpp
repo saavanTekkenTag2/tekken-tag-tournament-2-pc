@@ -208,6 +208,9 @@ extern "C" int SDL_main(int argc, char* argv[])
     // No sign-in dialog on Android: the last used profile is signed in at start (the save device needs a profile;
     // with none signed in the game asked for a storage device / to create save data and never got one).
     setDefault("TTT2_AUTO_SIGNIN", "1");
+    // SDL picks the activity's orientation from the window size; a window made while the phone was held upright
+    // came out portrait (a 1080x2266 swap chain), and the turn to landscape replaced the window mid-game.
+    setDefault("SDL_IOS_ORIENTATIONS", "LandscapeLeft LandscapeRight");   // SDL_HINT_ORIENTATIONS (Android too)
     // DXVK (D3D11 -> Vulkan): its log and pipeline state cache next to the game's log
     setDefault("DXVK_LOG_PATH", root + "/TTT2Recomp");
     setDefault("DXVK_LOG_LEVEL", "warn");

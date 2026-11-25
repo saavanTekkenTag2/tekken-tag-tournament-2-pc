@@ -85,6 +85,11 @@ PATCHES = [
     ("src/d3d11/d3d11_swapchain.cpp",
      '      SynchronizePresent();\n\n      if (!m_presenter->hasSwapChain())\n        return DXGI_STATUS_OCCLUDED;\n',
      '      SynchronizePresent();\n\n      if (!m_presenter->hasSwapChain()) {\n        RecreateSwapChain(m_vsync);   // the window may be back\n        if (!m_presenter->hasSwapChain())\n          return DXGI_STATUS_OCCLUDED;\n      }\n'),
+    # destroySurface freed the surface but kept its handle: the "no surface yet" check above never fired and the
+    # next recreation queried a destroyed surface (a jump to address 0 inside libvulkan after the window came back).
+    ("src/vulkan/vulkan_presenter.cpp",
+     '    m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);\n  }',
+     '    m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);\n    m_surface = VK_NULL_HANDLE;\n  }'),
 ]
 
 def apply(rel, old, new):
