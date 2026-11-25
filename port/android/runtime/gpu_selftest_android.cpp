@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 
 using Microsoft::WRL::ComPtr;
@@ -135,6 +136,44 @@ void Check(const char* name, bool ran, uint32_t got, uint32_t want, int& failed)
     Log("  %-34s %s  got %08X want %08X\n", name, ok ? "OK  " : "FAIL", ran ? got : 0u, want);
 }
 } // namespace
+
+// A feature probe: VS + PS into a fresh 2x2 RGBA8 target (cleared grey), `setup` binds anything extra and
+// may replace the draw (returns false to skip the default 3-vertex draw); the first pixel is compared.
+bool Probe(Ctx& c, int& failed, const char* name, const char* vsSrc, const char* psSrc, uint32_t want,
+           const std::function<bool(ID3D11DeviceContext*)>& setup = nullptr)
+{
+    uint32_t got = 0;
+    bool ran = false;
+    auto vsCode = Compile(vsSrc, "vs_5_0");
+    auto psCode = Compile(psSrc, "ps_5_0");
+    ComPtr<ID3D11VertexShader> vs; ComPtr<ID3D11PixelShader> ps;
+    if (vsCode && psCode && SUCCEEDED(c.dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs)) &&
+        SUCCEEDED(c.dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps)))
+    {
+        ComPtr<ID3D11RenderTargetView> rtv;
+        auto tex = Target(c, DXGI_FORMAT_R8G8B8A8_UNORM, rtv);
+        if (tex)
+        {
+            const float grey[4] = { 0.5f, 0.5f, 0.5f, 1 };
+            c.ctx->ClearState();
+            c.ctx->ClearRenderTargetView(rtv.Get(), grey);
+            c.ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+            const D3D11_VIEWPORT vp{ 0, 0, 2, 2, 0, 1 };
+            c.ctx->RSSetViewports(1, &vp);
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
+            ComPtr<ID3D11RasterizerState> rs; c.dev->CreateRasterizerState(&rd, &rs);
+            c.ctx->RSSetState(rs.Get());
+            c.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            c.ctx->VSSetShader(vs.Get(), nullptr, 0);
+            c.ctx->PSSetShader(ps.Get(), nullptr, 0);
+            if (!setup || setup(c.ctx.Get())) c.ctx->Draw(3, 0);
+            ran = ReadPixel(c, tex.Get(), got);
+        }
+    }
+    Check(name, ran, got, want, failed);
+    return ran && got == want;
+}
 
 extern "C" void Ttt2GpuSelfTest(const char* root)
 {
@@ -265,6 +304,170 @@ extern "C" void Ttt2GpuSelfTest(const char* root)
         const bool ok = ran && u[0] == 11 && u[1] == 22 && u[2] == 33 && u[3] == 44;
         if (!ok) ++failed;
         Log("  %-34s %s  got %u %u %u %u want 11 22 33 44\n", "8 uint target, nointerpolation", ok ? "OK  " : "FAIL", u[0], u[1], u[2], u[3]);
+    }
+    // ---- feature probes: what the game's renderer uses beyond the basics ----
+    {
+        const char* vsTri =
+            "struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };"
+            "O main(uint id : SV_VertexID) { O o; float2 t = float2((id << 1) & 2, id & 2);"
+            " o.p = float4(t * float2(2, -2) + float2(-1, 1), 0.5, 1); o.uv = t; return o; }";
+        // 8a uint target, constant output
+        {
+            auto psCode = Compile("uint4 main(float4 p : SV_Position) : SV_Target { return uint4(11, 22, 33, 44); }", "ps_5_0");
+            auto vsCode = Compile(vsTri, "vs_5_0");
+            ComPtr<ID3D11VertexShader> vs; ComPtr<ID3D11PixelShader> ps;
+            uint32_t u[4] = {}; bool ran = false;
+            if (psCode && vsCode && SUCCEEDED(c.dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs)) &&
+                SUCCEEDED(c.dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps)))
+            {
+                D3D11_TEXTURE2D_DESC td{}; td.Width = 2; td.Height = 2; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+                td.SampleDesc.Count = 1; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+                ComPtr<ID3D11Texture2D> t, st; ComPtr<ID3D11RenderTargetView> rtv;
+                c.dev->CreateTexture2D(&td, nullptr, &t);
+                td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                c.dev->CreateTexture2D(&td, nullptr, &st);
+                if (t && st && SUCCEEDED(c.dev->CreateRenderTargetView(t.Get(), nullptr, &rtv)))
+                {
+                    D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
+                    ComPtr<ID3D11RasterizerState> rs; c.dev->CreateRasterizerState(&rd, &rs);
+                    c.ctx->ClearState();
+                    c.ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                    const D3D11_VIEWPORT vp{ 0, 0, 2, 2, 0, 1 }; c.ctx->RSSetViewports(1, &vp);
+                    c.ctx->RSSetState(rs.Get());
+                    c.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    c.ctx->VSSetShader(vs.Get(), nullptr, 0); c.ctx->PSSetShader(ps.Get(), nullptr, 0);
+                    c.ctx->Draw(3, 0);
+                    c.ctx->CopyResource(st.Get(), t.Get());
+                    D3D11_MAPPED_SUBRESOURCE m{};
+                    if (SUCCEEDED(c.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) { std::memcpy(u, m.pData, 16); c.ctx->Unmap(st.Get(), 0); ran = true; }
+                }
+            }
+            const bool ok = ran && u[0] == 11 && u[1] == 22 && u[2] == 33 && u[3] == 44;
+            if (!ok) ++failed;
+            Log("  %-34s %s  got %u %u %u %u want 11 22 33 44\n", "8a uint target, constant", ok ? "OK  " : "FAIL", u[0], u[1], u[2], u[3]);
+        }
+        Probe(c, failed, "8b flat float varying",
+              "struct O { float4 p : SV_Position; nointerpolation float4 v : TEXCOORD0; };"
+              "O main(uint id : SV_VertexID) { O o; float2 t = float2((id << 1) & 2, id & 2);"
+              " o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.v = float4(0, 1, 1, 1); return o; }",
+              "struct O { float4 p : SV_Position; nointerpolation float4 v : TEXCOORD0; }; float4 main(O i) : SV_Target { return i.v; }",
+              0x00FFFFFFu);
+        Probe(c, failed, "8c flat uint varying -> float",
+              "struct O { float4 p : SV_Position; nointerpolation uint4 v : TEXCOORD0; };"
+              "O main(uint id : SV_VertexID) { O o; float2 t = float2((id << 1) & 2, id & 2);"
+              " o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.v = uint4(255, 0, 255, 255); return o; }",
+              "struct O { float4 p : SV_Position; nointerpolation uint4 v : TEXCOORD0; }; float4 main(O i) : SV_Target { return float4(i.v) / 255.0; }",
+              0xFF00FFFFu);
+        Probe(c, failed, "9 sixteen varyings (a[16])",
+              "struct O { float4 p : SV_Position; float4 a[16] : TEXCOORD0; };"
+              "O main(uint id : SV_VertexID) { O o; float2 t = float2((id << 1) & 2, id & 2);"
+              " o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);"
+              " [unroll] for (int i = 0; i < 16; i++) o.a[i] = float4(i / 15.0, 0, 1 - i / 15.0, 1); return o; }",
+              "struct O { float4 p : SV_Position; float4 a[16] : TEXCOORD0; }; float4 main(O i) : SV_Target { return i.a[15]; }",
+              0xFF0000FFu);
+        // 10 SV_Depth output with a D32_S8 depth buffer and a depth test (every translated pixel shader writes depth)
+        {
+            D3D11_TEXTURE2D_DESC dd{}; dd.Width = 2; dd.Height = 2; dd.MipLevels = dd.ArraySize = 1; dd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+            dd.SampleDesc.Count = 1; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            ComPtr<ID3D11Texture2D> dt; ComPtr<ID3D11DepthStencilView> dsv; ComPtr<ID3D11DepthStencilState> ds;
+            D3D11_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            D3D11_DEPTH_STENCIL_DESC dsd{}; dsd.DepthEnable = TRUE; dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; dsd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+            const bool made = SUCCEEDED(c.dev->CreateTexture2D(&dd, nullptr, &dt)) && SUCCEEDED(c.dev->CreateDepthStencilView(dt.Get(), &dv, &dsv)) &&
+                              SUCCEEDED(c.dev->CreateDepthStencilState(&dsd, &ds));
+            if (!made) Log("    depth buffer D32_S8 could not be made\n");
+            Probe(c, failed, "10 SV_Depth + D32S8 depth test", vsTri,
+                  "float4 main(float4 p : SV_Position, out float d : SV_Depth) : SV_Target { d = 0.25; return float4(1, 1, 0, 1); }",
+                  0xFFFF00FFu, [&](ID3D11DeviceContext* x) {
+                      if (!made) return true;
+                      x->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+                      ComPtr<ID3D11RenderTargetView> rtv; x->OMGetRenderTargets(1, &rtv, nullptr);
+                      ID3D11RenderTargetView* r = rtv.Get();
+                      x->OMSetRenderTargets(1, &r, dsv.Get());
+                      x->OMSetDepthStencilState(ds.Get(), 0);
+                      return true;
+                  });
+        }
+        // 11 vertex buffer + input layout (the CPU vertex path's pass-through vertex shader)
+        {
+            const char* vsIa = "struct O { float4 p : SV_Position; }; O main(float4 p : POSITION) { O o; o.p = p; return o; }";
+            auto vsCode = Compile(vsIa, "vs_5_0");
+            const float verts[12] = { -1, 1, 0, 1, 3, 1, 0, 1, -1, -3, 0, 1 };
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof verts; bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            D3D11_SUBRESOURCE_DATA init{ verts, 0, 0 };
+            ComPtr<ID3D11Buffer> vb; ComPtr<ID3D11InputLayout> il;
+            const D3D11_INPUT_ELEMENT_DESC el{ "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
+            const bool made = vsCode && SUCCEEDED(c.dev->CreateBuffer(&bd, &init, &vb)) &&
+                              SUCCEEDED(c.dev->CreateInputLayout(&el, 1, vsCode->GetBufferPointer(), vsCode->GetBufferSize(), &il));
+            Probe(c, failed, "11 vertex buffer + input layout", vsIa,
+                  "float4 main(float4 p : SV_Position) : SV_Target { return float4(0, 0, 1, 1); }", 0x0000FFFFu,
+                  [&](ID3D11DeviceContext* x) {
+                      if (!made) return true;
+                      const UINT stride = 16, offset = 0; ID3D11Buffer* b = vb.Get();
+                      x->IASetVertexBuffers(0, 1, &b, &stride, &offset);
+                      x->IASetInputLayout(il.Get());
+                      return true;
+                  });
+        }
+        // 12 raw buffer (ByteAddressBuffer) read in the vertex shader (the GPU vertex path)
+        {
+            const float pos[12] = { -1, 1, 0, 1, 3, 1, 0, 1, -1, -3, 0, 1 };
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof pos; bd.BindFlags = D3D11_BIND_SHADER_RESOURCE; bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            D3D11_SUBRESOURCE_DATA init{ pos, 0, 0 };
+            ComPtr<ID3D11Buffer> b; ComPtr<ID3D11ShaderResourceView> v;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{}; sd.Format = DXGI_FORMAT_R32_TYPELESS; sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+            sd.BufferEx.NumElements = 12; sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+            const bool made = SUCCEEDED(c.dev->CreateBuffer(&bd, &init, &b)) && SUCCEEDED(c.dev->CreateShaderResourceView(b.Get(), &sd, &v));
+            Probe(c, failed, "12 ByteAddressBuffer in the VS",
+                  "ByteAddressBuffer d : register(t0); float4 main(uint id : SV_VertexID) : SV_Position"
+                  " { return asfloat(d.Load4(id * 16)); }",
+                  "float4 main(float4 p : SV_Position) : SV_Target { return float4(1, 0, 0, 1); }", 0xFF0000FFu,
+                  [&](ID3D11DeviceContext* x) { if (made) x->VSSetShaderResources(0, 1, v.GetAddressOf()); return true; });
+        }
+        // 13 scissor on + depth clip off (the runtime's raster_ state, used by its present)
+        {
+            D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = FALSE; rd.ScissorEnable = TRUE;
+            ComPtr<ID3D11RasterizerState> rs; c.dev->CreateRasterizerState(&rd, &rs);
+            Probe(c, failed, "13 scissor on, depth clip off", vsTri,
+                  "float4 main(float4 p : SV_Position) : SV_Target { return float4(0, 1, 0, 1); }", 0x00FF00FFu,
+                  [&](ID3D11DeviceContext* x) { const D3D11_RECT r{ 0, 0, 2, 2 }; x->RSSetState(rs.Get()); x->RSSetScissorRects(1, &r); return true; });
+        }
+        // 14 R8 texture (the movie's Y/U/V planes) sampled with SampleGrad
+        {
+            D3D11_TEXTURE2D_DESC td{}; td.Width = 2; td.Height = 2; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            const uint8_t texels[4] = { 0x80, 0x80, 0x80, 0x80 };
+            D3D11_SUBRESOURCE_DATA init{ texels, 2, 0 };
+            ComPtr<ID3D11Texture2D> t; ComPtr<ID3D11ShaderResourceView> v; ComPtr<ID3D11SamplerState> smp;
+            D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd.MaxLOD = D3D11_FLOAT32_MAX;
+            const bool made = SUCCEEDED(c.dev->CreateTexture2D(&td, &init, &t)) && SUCCEEDED(c.dev->CreateShaderResourceView(t.Get(), nullptr, &v)) &&
+                              SUCCEEDED(c.dev->CreateSamplerState(&sd, &smp));
+            Probe(c, failed, "14 R8 texture + SampleGrad", vsTri,
+                  "Texture2D<float4> tx : register(t0); SamplerState s : register(s0);"
+                  " float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target"
+                  " { float2 g = uv * 2; float4 f = tx.SampleGrad(s, uv * 0.5, ddx(g), ddy(g)); return float4(f.r, f.r, f.r, 1); }",
+                  0x808080FFu,
+                  [&](ID3D11DeviceContext* x) { if (made) { x->PSSetShaderResources(0, 1, v.GetAddressOf()); x->PSSetSamplers(0, 1, smp.GetAddressOf()); } return true; });
+        }
+        // 15 static global written in a function, read in main (the translated shaders' wroteDepth / eDepth)
+        Probe(c, failed, "15 static globals across functions", vsTri,
+              "static float4 g = float4(0, 0, 0, 0); static bool w = false;"
+              " void F() { w = true; g = float4(1, 0, 1, 1); }"
+              " float4 main(float4 p : SV_Position) : SV_Target { F(); return w ? g : float4(0, 0, 0, 1); }",
+              0xFF00FFFFu);
+        // 16 dynamic indexing of a cbuffer uint4 array component (XBool / XLoop / texInfo)
+        {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = 64; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            const uint32_t data[16] = { 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+            D3D11_SUBRESOURCE_DATA init{ data, 0, 0 };
+            ComPtr<ID3D11Buffer> cb;
+            const bool made = SUCCEEDED(c.dev->CreateBuffer(&bd, &init, &cb));
+            Probe(c, failed, "16 dynamic cbuffer uint4[i][j]", vsTri,
+                  "cbuffer C : register(b0) { uint4 k[4]; };"
+                  " float4 main(float4 p : SV_Position) : SV_Target { uint i = (uint)p.x * 0 + 1; uint j = 2 + (uint)p.y * 0;"
+                  " return float4(k[i][j] / 255.0, 0, 0, 1); }",
+                  0xFF0000FFu,
+                  [&](ID3D11DeviceContext* x) { if (made) { ID3D11Buffer* b = cb.Get(); x->PSSetConstantBuffers(0, 1, &b); } return true; });
+        }
     }
     Log("[gpu-selftest] %s (%d failed)\n", failed ? "FAILED" : "all passed", failed);
     if (g_out) std::fclose(g_out);
