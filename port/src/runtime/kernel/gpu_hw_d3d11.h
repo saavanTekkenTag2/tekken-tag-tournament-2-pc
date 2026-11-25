@@ -21,6 +21,7 @@
 #include "display_settings.h"
 #include "gpu_fps_overlay.h"
 #include "log_utf8.h"
+#include "android_affinity.h"
 #include <d3d11_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -4571,6 +4572,42 @@ private:
     // the build lands, instead of the whole game stalling on D3DCompile (one TTT2 pixel shader
     // takes 4.4 s even unoptimised; a cold cache stalled the fight start 3.5 s).
     // TTT2_SHADER_ASYNC=0: wait for every build.
+    // r22: at most a few shader builds at once, on the background cores. Every new shader started its own build thread
+    // at once, and on a phone a fight start's dozens of them took every core from the game's main thread and the
+    // command processor (the "freeze" in the first seconds of a match). Android: the little cores, lower priority, as
+    // many builds as little cores less one (1-3); elsewhere 4. TTT2_SHADER_THREADS=N sets it.
+    struct BuildGate
+    {
+        static std::mutex& M() { static std::mutex m; return m; }
+        static std::condition_variable& Cv() { static std::condition_variable c; return c; }
+        static int& Free()
+        {
+            static int n = [] {
+                if (const char* e = std::getenv("TTT2_SHADER_THREADS"); e && std::atoi(e) > 0) return std::atoi(e);
+#ifdef __ANDROID__
+                const int little = ttt2_affinity::Get().nLittle;
+                return little > 1 ? std::min(3, little - 1) : 2;
+#else
+                return 4;
+#endif
+            }();
+            return n;
+        }
+        BuildGate()
+        {
+#ifdef __ANDROID__
+            ttt2_affinity::BackgroundThread();
+#endif
+            std::unique_lock lock(M());
+            Cv().wait(lock, [] { return Free() > 0; });
+            --Free();
+        }
+        ~BuildGate()
+        {
+            { std::lock_guard lock(M()); ++Free(); }
+            Cv().notify_one();
+        }
+    };
     template <class Entry> struct Built { BuildResult result = BuildResult::CompileFailed; Entry entry; BuildCounts counts; std::string why; };
     std::unordered_map<uint64_t, std::future<Built<VsEntry>>> pendingVs_;
     std::unordered_map<uint64_t, std::future<Built<PsEntry>>> pendingPs_;
@@ -4582,7 +4619,7 @@ private:
     {
         static const bool async = [] { const char* e = std::getenv("TTT2_SHADER_ASYNC"); return !e || std::strcmp(e, "0") != 0; }();
         auto it = pending.find(key);
-        if (it == pending.end()) it = pending.emplace(key, std::async(std::launch::async, build)).first;
+        if (it == pending.end()) it = pending.emplace(key, std::async(std::launch::async, [build] { BuildGate gate; return build(); })).first;
         const auto start = std::chrono::steady_clock::now();
         const bool ready = !async ? (it->second.wait(), true)
                                   : it->second.wait_for(std::chrono::duration<double, std::milli>(wait ? std::max(0.0, buildBudgetMs_) : 0.0)) ==
@@ -4722,7 +4759,14 @@ private:
         // Vertex shaders always compile optimised: they are small (milliseconds either way), and an
         // unoptimised compile crashed D3DCompile itself (MEASURED: a vertex fetch into r0 inside the
         // program's do / while (false), d3dcompiler_47 +77EBC reading address -1; optimised: fine).
+#ifdef __ANDROID__
+        // r22: vkd3d-shader ignores D3DCOMPILE_SKIP_OPTIMIZATION / OPTIMIZATION_LEVEL ("Ignoring flags"), so the
+        // "unoptimised now, optimised in the background" pair compiled the same shader twice: the one compile is cached.
+        const bool fast = false;
+        (void)fastInGame;
+#else
         const bool fast = inGame && fastInGame && !vertex;
+#endif
         const char* target = vertex ? "vs_5_0" : "ps_5_0";
         const char* label = vertex ? "ttt2 translated vs" : "ttt2 translated ps";
         try

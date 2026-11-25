@@ -1,5 +1,9 @@
 package com.saavan.ttt2;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
@@ -10,7 +14,11 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Outline;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -18,12 +26,20 @@ import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
+import android.text.InputType;
 import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
 import android.view.WindowManager;
-import android.widget.Button;
+import android.view.animation.DecelerateInterpolator;
+import android.view.animation.LinearInterpolator;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
-import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -33,27 +49,46 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
-import java.io.InputStreamReader;
-import java.util.regex.Pattern;
 
 /**
- * Launcher and installer. The player picks their own Tekken Tag Tournament 2 disc image and the
- * Title Update 3 file with Android's file picker; libmain.so builds the game folder from them
- * (android_install.cpp: the PC installer's steps). Then PLAY starts GameActivity.
+ * Launcher (r22 redesign): an animated home screen over the game's art - PLAY, SELECT ISO, SELECT TITLE UPDATE,
+ * OPTIONS (every setting: Settings.java), CREDITS (Credits.java). The player picks their own disc image and
+ * Title Update 3 with Android's file picker; libmain.so builds the game folder from them (android_install.cpp).
+ * Motion: opacity and transform only (no live blur), 0.2-0.4 s transitions; OPTIONS -> LAUNCHER -> REMOVE
+ * ANIMATIONS (or the system's "Remove animations") shows everything at once.
  * Game folder, saves and logs: Android/data/com.saavan.ttt2/files.
  */
 public class LauncherActivity extends Activity {
     private static final int PICK_ISO = 1, PICK_TU = 2;
 
+    // The game's colours: Tekken red, steel / silver, smoke violet, ink black.
+    static final int RED = Color.rgb(226, 22, 34), RED_DARK = Color.rgb(120, 8, 16), SILVER = Color.rgb(222, 224, 232),
+        STEEL = Color.rgb(150, 154, 170), INK = Color.rgb(9, 8, 13), SMOKE = Color.rgb(64, 58, 88), BLUE = Color.rgb(70, 160, 255);
+
     private SharedPreferences prefs;
-    private TextView isoText, tuText, status, info;
-    private Button isoButton, tuButton, installButton, playButton, cancelButton;
+    private FrameLayout root, pages;
+    private ImageView bg;
+    private final List<View> streaks = new ArrayList<>();
+    private final List<Animator> loops = new ArrayList<>();
+    private View home, current;
+    private TextView status, cornerVersion;
     private ProgressBar progress;
+    private MenuItem playItem, isoItem, tuItem;
+    private final List<MenuItem> menuItems = new ArrayList<>();
+    private View installPanel;
+    private TextView installText;
+    private ProgressBar installBar;
     private volatile boolean cancel;
-    private boolean installing;
+    private boolean installing, entered;
+    private Typeface bold, semi, regular;
 
     static String dataRoot(Context c) {
         File f = c.getExternalFilesDir(null);
@@ -69,166 +104,766 @@ public class LauncherActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("ttt2", MODE_PRIVATE);
-        setContentView(buildUi());
+        try { bold = getResources().getFont(R.font.oswald_bold); semi = getResources().getFont(R.font.oswald_semibold); regular = getResources().getFont(R.font.oswald_regular); }
+        catch (Exception e) { bold = Typeface.DEFAULT_BOLD; semi = Typeface.DEFAULT_BOLD; regular = Typeface.DEFAULT; }
+        setContentView(buildRoot());
+        hideSystemBars();
         refresh();
     }
 
-    // ---------------------------------------------------------------- UI
-    private Button button(String text, int color) {
-        Button b = new Button(this);
-        b.setText(text);
-        b.setAllCaps(false);
-        b.setTextColor(Color.WHITE);
-        b.setTextSize(16);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(color);
-        bg.setCornerRadius(dp(10));
-        b.setBackground(bg);
-        b.setPadding(dp(16), dp(10), dp(16), dp(10));
-        return b;
+    private boolean noAnim() { return Settings.animationsOff(this); }
+    private int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+    private void hideSystemBars() {
+        getWindow().getDecorView().setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
     }
 
-    private TextView label(String text, float size, int color) {
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) hideSystemBars();
+    }
+
+    // ================================================================ building blocks
+    private TextView text(String s, float size, int color, Typeface tf) {
         TextView t = new TextView(this);
-        t.setText(text);
+        t.setText(s);
         t.setTextSize(size);
         t.setTextColor(color);
+        t.setTypeface(tf);
+        t.setIncludeFontPadding(false);
         return t;
     }
 
-    private int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+    private static FrameLayout.LayoutParams flp(int w, int h, int gravity) {
+        FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(w, h);
+        p.gravity = gravity;
+        return p;
+    }
 
-    private LinearLayout.LayoutParams lp(int top) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    private LinearLayout.LayoutParams llp(int w, int h, int top) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
         p.topMargin = dp(top);
         return p;
     }
 
-    private View buildUi() {
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(dp(28), dp(20), dp(28), dp(20));
-        col.setBackgroundColor(Color.rgb(14, 14, 22));
-
-        TextView title = label("TEKKEN TAG TOURNAMENT 2", 26, Color.rgb(255, 140, 40));
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        col.addView(title);
-        col.addView(label("Native Android port (static recompilation). Uses your own disc image and Title Update 3.", 13, Color.LTGRAY), lp(4));
-
-        LinearLayout row1 = new LinearLayout(this);
-        row1.setOrientation(LinearLayout.HORIZONTAL);
-        row1.setGravity(Gravity.CENTER_VERTICAL);
-        isoButton = button("1. Disc image (.iso)", Color.rgb(60, 60, 90));
-        isoButton.setOnClickListener(v -> pick(PICK_ISO));
-        row1.addView(isoButton);
-        isoText = label("", 13, Color.WHITE);
-        isoText.setPadding(dp(14), 0, 0, 0);
-        row1.addView(isoText);
-        col.addView(row1, lp(16));
-
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        row2.setGravity(Gravity.CENTER_VERTICAL);
-        tuButton = button("2. Title Update 3 (TU_...O2)", Color.rgb(60, 60, 90));
-        tuButton.setOnClickListener(v -> pick(PICK_TU));
-        row2.addView(tuButton);
-        tuText = label("", 13, Color.WHITE);
-        tuText.setPadding(dp(14), 0, 0, 0);
-        row2.addView(tuText);
-        col.addView(row2, lp(8));
-
-        LinearLayout row3 = new LinearLayout(this);
-        row3.setOrientation(LinearLayout.HORIZONTAL);
-        installButton = button("3. Install", Color.rgb(40, 110, 200));
-        installButton.setOnClickListener(v -> startInstall());
-        row3.addView(installButton);
-        cancelButton = button("Cancel", Color.rgb(120, 40, 40));
-        cancelButton.setOnClickListener(v -> cancel = true);
-        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        cp.leftMargin = dp(10);
-        row3.addView(cancelButton, cp);
-        col.addView(row3, lp(12));
-
-        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progress.setMax(100);
-        col.addView(progress, lp(10));
-        status = label("", 14, Color.WHITE);
-        col.addView(status, lp(4));
-
-        LinearLayout row4 = new LinearLayout(this);
-        row4.setOrientation(LinearLayout.HORIZONTAL);
-        row4.setGravity(Gravity.CENTER_VERTICAL);
-        playButton = button("  PLAY  ", Color.rgb(230, 100, 20));
-        playButton.setTextSize(22);
-        playButton.setOnClickListener(v -> play());
-        row4.addView(playButton);
-        CheckBox touch = new CheckBox(this);
-        touch.setText("On-screen controls");
-        touch.setTextColor(Color.WHITE);
-        touch.setChecked(prefs.getBoolean("touch", true));
-        touch.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("touch", on).apply());
-        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        tp.leftMargin = dp(18);
-        row4.addView(touch, tp);
-        Button log = button("Logs", Color.rgb(60, 60, 60));
-        log.setOnClickListener(v -> showLog());
-        LinearLayout.LayoutParams lpp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lpp.leftMargin = dp(18);
-        row4.addView(log, lpp);
-        col.addView(row4, lp(18));
-
-        LinearLayout row5 = new LinearLayout(this);
-        row5.setOrientation(LinearLayout.HORIZONTAL);
-        row5.setGravity(Gravity.CENTER_VERTICAL);
-        CheckBox fb = new CheckBox(this);
-        fb.setText("Debug: save frames (slower)");
-        fb.setTextColor(Color.LTGRAY);
-        fb.setChecked(prefs.getBoolean("fbdump", false));
-        fb.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("fbdump", on).apply());
-        row5.addView(fb);
-        Button frames = button("Frames", Color.rgb(60, 60, 60));
-        frames.setOnClickListener(v -> showFrames());
-        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        fp.leftMargin = dp(18);
-        row5.addView(frames, fp);
-        CheckBox cpu = new CheckBox(this);
-        cpu.setText("CPU renderer (slow test)");
-        cpu.setTextColor(Color.LTGRAY);
-        cpu.setChecked(prefs.getBoolean("cpu", false));
-        cpu.setOnCheckedChangeListener((b, on) -> prefs.edit().putBoolean("cpu", on).apply());
-        LinearLayout.LayoutParams cpp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        cpp.leftMargin = dp(12);
-        row5.addView(cpu, cpp);
-        Button export = button("Export debug", Color.rgb(60, 60, 60));
-        export.setOnClickListener(v -> exportDebug());
-        LinearLayout.LayoutParams ep = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        ep.leftMargin = dp(12);
-        row5.addView(export, ep);
-        col.addView(row5, lp(10));
-
-        info = label("", 12, Color.GRAY);
-        col.addView(info, lp(14));
-
-        ScrollView sv = new ScrollView(this);
-        sv.addView(col);
-        return sv;
+    /** A slanted plate (the game's menu look): dark glass, a red edge on the left, a silver hairline. */
+    static final class Plate extends android.graphics.drawable.Drawable {
+        final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), edge = new Paint(Paint.ANTI_ALIAS_FLAG), line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final float slant;
+        Plate(float slant, int fillColor, int edgeColor) {
+            this.slant = slant;
+            fill.setColor(fillColor);
+            edge.setColor(edgeColor);
+            line.setStyle(Paint.Style.STROKE);
+            line.setStrokeWidth(1.5f);
+            line.setColor(Color.argb(70, 220, 224, 235));
+        }
+        @Override public void draw(Canvas c) {
+            float w = getBounds().width(), h = getBounds().height();
+            Path p = new Path();
+            p.moveTo(slant, 0); p.lineTo(w, 0); p.lineTo(w - slant, h); p.lineTo(0, h); p.close();
+            c.drawPath(p, fill);
+            c.drawPath(p, line);
+            Path e = new Path();
+            float ew = slant * 0.55f + 6;
+            e.moveTo(slant, 0); e.lineTo(slant + ew, 0); e.lineTo(ew, h); e.lineTo(0, h); e.close();
+            c.drawPath(e, edge);
+        }
+        @Override public void setAlpha(int a) {}
+        @Override public void setColorFilter(android.graphics.ColorFilter cf) {}
+        @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
     }
 
+    /** A home-menu entry: the plate, a bright plate on top shown on press / focus, the title and a small subtitle. */
+    final class MenuItem extends FrameLayout {
+        final View glow;
+        final TextView title, sub;
+        MenuItem(String label, Runnable action) {
+            super(LauncherActivity.this);
+            setFocusable(true);
+            setClickable(true);
+            setBackground(new Plate(dp(16), Color.argb(170, 12, 10, 18), RED));
+            glow = new View(getContext());
+            glow.setBackground(new Plate(dp(16), Color.argb(150, 160, 14, 26), Color.rgb(255, 70, 70)));
+            glow.setAlpha(0f);
+            addView(glow, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+            LinearLayout col = new LinearLayout(getContext());
+            col.setOrientation(LinearLayout.VERTICAL);
+            col.setGravity(Gravity.CENTER_VERTICAL);
+            col.setPadding(dp(34), 0, dp(22), 0);
+            title = text(label, 19, SILVER, bold);
+            title.setLetterSpacing(0.06f);
+            col.addView(title);
+            sub = text("", 10.5f, STEEL, regular);
+            sub.setLetterSpacing(0.04f);
+            sub.setVisibility(GONE);
+            col.addView(sub);
+            addView(col, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+            setOnClickListener(v -> action.run());
+            setOnFocusChangeListener((v, f) -> highlight(f));
+            setOnTouchListener((v, ev) -> {
+                if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) press(true);
+                else if (ev.getActionMasked() == MotionEvent.ACTION_UP || ev.getActionMasked() == MotionEvent.ACTION_CANCEL) press(false);
+                return false;
+            });
+        }
+        void setSub(String s) { sub.setText(s); sub.setVisibility(s == null || s.isEmpty() ? GONE : VISIBLE); }
+        void press(boolean down) {
+            if (noAnim()) { glow.setAlpha(down || isFocused() ? 1f : 0f); return; }
+            animate().scaleX(down ? 0.96f : 1f).scaleY(down ? 0.96f : 1f).setDuration(down ? 120 : 220).setInterpolator(new DecelerateInterpolator()).start();
+            glow.animate().alpha(down || isFocused() ? 1f : 0f).setDuration(down ? 120 : 260).start();
+        }
+        void highlight(boolean on) {
+            if (noAnim()) { glow.setAlpha(on ? 1f : 0f); setTranslationX(on ? dp(10) : 0); return; }
+            glow.animate().alpha(on ? 1f : 0f).setDuration(220).start();
+            animate().translationX(on ? dp(10) : 0).setDuration(240).setInterpolator(new DecelerateInterpolator()).start();
+        }
+    }
+
+    // ================================================================ root and home
+    private View buildRoot() {
+        root = new FrameLayout(this);
+        root.setBackgroundColor(INK);
+
+        bg = new ImageView(this);
+        bg.setImageResource(R.drawable.home_bg);
+        bg.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        root.addView(bg, flp(-1, -1, Gravity.FILL));
+
+        // Static scrims (no live blur): darker left half for the menu, darker bottom edge for the footer.
+        View left = new View(this);
+        left.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+            new int[] { Color.argb(215, 6, 5, 10), Color.argb(130, 6, 5, 10), Color.argb(0, 6, 5, 10) }));
+        root.addView(left, flp(-1, -1, Gravity.FILL));
+        View bottom = new View(this);
+        bottom.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
+            new int[] { Color.argb(220, 6, 5, 10), Color.argb(0, 6, 5, 10) }));
+        root.addView(bottom, flp(-1, dp(90), Gravity.BOTTOM));
+
+        // Light streaks sweeping across (transform + opacity only).
+        int[][] streakColors = { { RED, 0 }, { SILVER, 0 }, { BLUE, 0 } };
+        for (int i = 0; i < 3; i++) {
+            View s = new View(this);
+            GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] { Color.argb(0, 255, 255, 255), withAlpha(streakColors[i][0], 200), Color.argb(0, 255, 255, 255) });
+            s.setBackground(g);
+            s.setRotation(-14f);
+            s.setAlpha(0f);
+            root.addView(s, flp(dp(260), dp(i == 1 ? 1.5f : 2.5f), Gravity.TOP | Gravity.START));
+            streaks.add(s);
+        }
+
+        pages = new FrameLayout(this);
+        root.addView(pages, flp(-1, -1, Gravity.FILL));
+        home = buildHome();
+        pages.addView(home, flp(-1, -1, Gravity.FILL));
+        current = home;
+
+        installPanel = buildInstallPanel();
+        installPanel.setVisibility(View.GONE);
+        root.addView(installPanel, flp(-1, -1, Gravity.FILL));
+        return root;
+    }
+
+    private static int withAlpha(int c, int a) { return Color.argb(a, Color.red(c), Color.green(c), Color.blue(c)); }
+
+    private View buildHome() {
+        FrameLayout f = new FrameLayout(this);
+        // The art's logo is in its top-left third; the menu sits under it.
+        LinearLayout menu = new LinearLayout(this);
+        menu.setOrientation(LinearLayout.VERTICAL);
+        playItem = new MenuItem("PLAY", this::play);
+        isoItem = new MenuItem("SELECT ISO", () -> pick(PICK_ISO));
+        tuItem = new MenuItem("SELECT TITLE UPDATE", () -> pick(PICK_TU));
+        MenuItem options = new MenuItem("OPTIONS", () -> showPage(buildOptions()));
+        MenuItem credits = new MenuItem("CREDITS", () -> showPage(buildCredits()));
+        menuItems.clear();
+        menuItems.add(playItem); menuItems.add(isoItem); menuItems.add(tuItem); menuItems.add(options); menuItems.add(credits);
+        playItem.title.setTextSize(23);
+        for (int i = 0; i < menuItems.size(); i++)
+            menu.addView(menuItems.get(i), llp(dp(300), dp(i == 0 ? 46 : 40), i == 0 ? 0 : 7));
+        FrameLayout.LayoutParams mp = flp(-2, -2, Gravity.START | Gravity.BOTTOM);
+        mp.leftMargin = dp(26);
+        mp.bottomMargin = dp(40);
+        f.addView(menu, mp);
+
+        // Footer: install status on the left, the port's author on the right.
+        LinearLayout foot = new LinearLayout(this);
+        foot.setOrientation(LinearLayout.VERTICAL);
+        status = text("", 11, STEEL, regular);
+        foot.addView(status);
+        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progress.setMax(100);
+        progress.setVisibility(View.GONE);
+        foot.addView(progress, llp(dp(300), dp(4), 3));
+        FrameLayout.LayoutParams fp = flp(-2, -2, Gravity.START | Gravity.BOTTOM);
+        fp.leftMargin = dp(30);
+        fp.bottomMargin = dp(14);
+        f.addView(foot, fp);
+
+        LinearLayout corner = new LinearLayout(this);
+        corner.setOrientation(LinearLayout.VERTICAL);
+        corner.setGravity(Gravity.END);
+        TextView by = text("PORT BY", 9.5f, STEEL, semi);
+        by.setLetterSpacing(0.25f);
+        corner.addView(by);
+        TextView name = text(Credits.PORT_BY, 15, SILVER, bold);
+        name.setLetterSpacing(0.08f);
+        corner.addView(name);
+        cornerVersion = text(version(), 9.5f, STEEL, regular);
+        corner.addView(cornerVersion);
+        FrameLayout.LayoutParams cp = flp(-2, -2, Gravity.END | Gravity.BOTTOM);
+        cp.rightMargin = dp(24);
+        cp.bottomMargin = dp(14);
+        f.addView(corner, cp);
+        f.setTag(corner);
+        return f;
+    }
+
+    private String version() {
+        try { return "v" + getPackageManager().getPackageInfo(getPackageName(), 0).versionName; }
+        catch (Exception e) { return ""; }
+    }
+
+    // ================================================================ motion
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refresh();
+        if (!entered) { entered = true; root.post(this::enter); }
+        startLoops();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        stopLoops();
+    }
+
+    /** Entrance: the art fades and settles, the menu slides in one entry after another, the corner fades in. */
+    private void enter() {
+        View corner = (View) home.getTag();
+        if (noAnim()) {
+            bg.setAlpha(1f); bg.setScaleX(1.06f); bg.setScaleY(1.06f);
+            for (MenuItem m : menuItems) { m.setAlpha(1f); m.setTranslationX(0); }
+            corner.setAlpha(1f);
+            playItem.requestFocus();
+            return;
+        }
+        bg.setAlpha(0f); bg.setScaleX(1.14f); bg.setScaleY(1.14f);
+        bg.animate().alpha(1f).scaleX(1.06f).scaleY(1.06f).setDuration(400).setInterpolator(new DecelerateInterpolator()).start();
+        for (int i = 0; i < menuItems.size(); i++) {
+            MenuItem m = menuItems.get(i);
+            m.setAlpha(0f);
+            m.setTranslationX(-dp(60));
+            m.animate().alpha(1f).translationX(0).setStartDelay(160 + i * 60L).setDuration(320).setInterpolator(new DecelerateInterpolator(1.6f)).start();
+        }
+        corner.setAlpha(0f);
+        corner.animate().alpha(1f).setStartDelay(420).setDuration(300).start();
+        playItem.postDelayed(playItem::requestFocus, 500);
+    }
+
+    /** Background motion: a slow drift of the art and light streaks crossing now and then. */
+    private void startLoops() {
+        stopLoops();
+        if (noAnim()) { bg.setScaleX(1.06f); bg.setScaleY(1.06f); return; }
+        ObjectAnimator drift = ObjectAnimator.ofFloat(bg, View.TRANSLATION_X, -dp(14), dp(14));
+        drift.setDuration(18000);
+        drift.setRepeatCount(ValueAnimator.INFINITE);
+        drift.setRepeatMode(ValueAnimator.REVERSE);
+        drift.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
+        drift.start();
+        loops.add(drift);
+        ObjectAnimator driftY = ObjectAnimator.ofFloat(bg, View.TRANSLATION_Y, dp(6), -dp(6));
+        driftY.setDuration(23000);
+        driftY.setRepeatCount(ValueAnimator.INFINITE);
+        driftY.setRepeatMode(ValueAnimator.REVERSE);
+        driftY.start();
+        loops.add(driftY);
+        for (int i = 0; i < streaks.size(); i++) {
+            final View s = streaks.get(i);
+            final int idx = i;
+            ValueAnimator a = ValueAnimator.ofFloat(0f, 1f);
+            a.setDuration(2600 + i * 500L);
+            a.setStartDelay(900 + i * 1700L);
+            a.setRepeatCount(ValueAnimator.INFINITE);
+            a.setInterpolator(new LinearInterpolator());
+            a.addUpdateListener(an -> {
+                float t = (float) an.getAnimatedValue();
+                float w = root.getWidth(), h = root.getHeight();
+                s.setTranslationX(-dp(300) + t * (w + dp(600)));
+                s.setTranslationY(h * (0.18f + 0.27f * idx) - t * h * 0.12f);
+                s.setAlpha((float) Math.sin(Math.PI * t) * (idx == 1 ? 0.55f : 0.8f));
+            });
+            a.start();
+            loops.add(a);
+        }
+    }
+
+    private void stopLoops() {
+        for (Animator a : loops) a.cancel();
+        loops.clear();
+        for (View s : streaks) s.setAlpha(0f);
+    }
+
+    /** Page change: the old page slides out to the left and fades, the new one slides in from the right. */
+    private void showPage(View next) {
+        if (next == current) return;
+        final View old = current;
+        current = next;
+        if (next.getParent() == null) pages.addView(next, flp(-1, -1, Gravity.FILL));
+        if (noAnim()) {
+            if (old != home) pages.removeView(old); else old.setVisibility(View.GONE);
+            next.setVisibility(View.VISIBLE); next.setAlpha(1f); next.setTranslationX(0);
+            next.requestFocus();
+            return;
+        }
+        old.animate().alpha(0f).translationX(-dp(36)).setDuration(220).setInterpolator(new DecelerateInterpolator())
+            .setListener(new AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(Animator a) {
+                    old.animate().setListener(null);
+                    if (old != home) pages.removeView(old); else old.setVisibility(View.GONE);
+                }
+            }).start();
+        next.setVisibility(View.VISIBLE);
+        next.setAlpha(0f);
+        next.setTranslationX(dp(36));
+        next.animate().alpha(1f).translationX(0).setStartDelay(90).setDuration(300).setInterpolator(new DecelerateInterpolator(1.4f))
+            .setListener(null).start();
+        next.requestFocus();
+    }
+
+    private void goHome() {
+        home.setAlpha(noAnim() ? 1f : home.getAlpha());
+        showPage(home);
+        refresh();
+        playItem.requestFocus();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (installPanel.getVisibility() == View.VISIBLE) return;
+        if (current != home) goHome();
+        else super.onBackPressed();
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if ((keyCode == KeyEvent.KEYCODE_BUTTON_B) && current != home) { goHome(); return true; }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    // ================================================================ page frame
+    /** A page: a back plate and a title at the top left, the content under it on a dark glass panel. */
+    private FrameLayout page(String title, View content) {
+        FrameLayout f = new FrameLayout(this);
+        f.setClickable(true);
+        View shade = new View(this);
+        shade.setBackgroundColor(Color.argb(150, 6, 5, 10));
+        f.addView(shade, flp(-1, -1, Gravity.FILL));
+
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(26), dp(16), dp(26), dp(12));
+        LinearLayout head = new LinearLayout(this);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView back = text("‹  BACK", 13, SILVER, semi);
+        back.setLetterSpacing(0.12f);
+        back.setPadding(dp(22), dp(7), dp(20), dp(7));
+        back.setBackground(new Plate(dp(10), Color.argb(170, 12, 10, 18), RED));
+        back.setFocusable(true);
+        back.setOnClickListener(v -> goHome());
+        tapFeedback(back);
+        head.addView(back);
+        TextView t = text(title, 26, SILVER, bold);
+        t.setLetterSpacing(0.1f);
+        t.setPadding(dp(18), 0, 0, 0);
+        head.addView(t);
+        View bar = new View(this);
+        bar.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[] { RED, Color.argb(0, 226, 22, 34) }));
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, dp(2), 1f);
+        bp.leftMargin = dp(16);
+        head.addView(bar, bp);
+        col.addView(head);
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        cp.topMargin = dp(10);
+        col.addView(content, cp);
+        f.addView(col, flp(-1, -1, Gravity.FILL));
+        return f;
+    }
+
+    private void tapFeedback(View v) {
+        v.setOnTouchListener((view, ev) -> {
+            if (noAnim()) return false;
+            if (ev.getActionMasked() == MotionEvent.ACTION_DOWN)
+                view.animate().scaleX(0.95f).scaleY(0.95f).alpha(0.85f).setDuration(110).start();
+            else if (ev.getActionMasked() == MotionEvent.ACTION_UP || ev.getActionMasked() == MotionEvent.ACTION_CANCEL)
+                view.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(220).start();
+            return false;
+        });
+    }
+
+    private GradientDrawable panel(int alpha) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.argb(alpha, 14, 12, 20));
+        g.setStroke(dp(1), Color.argb(60, 220, 224, 235));
+        g.setCornerRadius(dp(4));
+        return g;
+    }
+
+    // ================================================================ OPTIONS
+    private String optionsGroup = "DISPLAY";
+
+    private View buildOptions() {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+
+        // Group tabs.
+        HorizontalScrollView tabsScroll = new HorizontalScrollView(this);
+        tabsScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout tabs = new LinearLayout(this);
+        tabsScroll.addView(tabs);
+        col.addView(tabsScroll);
+
+        ScrollView sv = new ScrollView(this);
+        sv.setFillViewport(true);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(4), dp(6), dp(4), dp(20));
+        sv.addView(list);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        sp.topMargin = dp(8);
+        col.addView(sv, sp);
+
+        final List<TextView> tabViews = new ArrayList<>();
+        String[] groups = new String[Settings.GROUPS.length + 1];
+        System.arraycopy(Settings.GROUPS, 0, groups, 0, Settings.GROUPS.length);
+        groups[groups.length - 1] = "TOOLS";
+        for (String g : groups) {
+            TextView tab = text(g, 13, STEEL, semi);
+            tab.setLetterSpacing(0.14f);
+            tab.setPadding(dp(18), dp(8), dp(18), dp(8));
+            tab.setFocusable(true);
+            tab.setOnClickListener(v -> {
+                optionsGroup = g;
+                for (TextView tv : tabViews) styleTab(tv, tv.getText().toString().equals(optionsGroup));
+                fillOptions(list);
+                if (!noAnim()) {
+                    list.setAlpha(0f); list.setTranslationY(dp(10));
+                    list.animate().alpha(1f).translationY(0).setDuration(240).setInterpolator(new DecelerateInterpolator()).start();
+                }
+                sv.scrollTo(0, 0);
+            });
+            tapFeedback(tab);
+            tabViews.add(tab);
+            LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-2, -2);
+            tp.rightMargin = dp(6);
+            tabs.addView(tab, tp);
+        }
+        for (TextView tv : tabViews) styleTab(tv, tv.getText().toString().equals(optionsGroup));
+        fillOptions(list);
+        return page("OPTIONS", col);
+    }
+
+    private void styleTab(TextView t, boolean on) {
+        t.setTextColor(on ? Color.WHITE : STEEL);
+        t.setBackground(new Plate(dp(9), on ? Color.argb(200, 150, 12, 24) : Color.argb(140, 12, 10, 18), on ? Color.rgb(255, 80, 80) : Color.argb(120, 226, 22, 34)));
+    }
+
+    private void fillOptions(LinearLayout list) {
+        list.removeAllViews();
+        if (optionsGroup.equals("TOOLS")) { fillTools(list); return; }
+        final LinkedHashMap<String, LinkedHashMap<String, String>> ini = Settings.readIni(this);
+        if (optionsGroup.equals("DISPLAY") || optionsGroup.equals("GAME") || optionsGroup.equals("ONLINE"))
+            list.addView(note("These are the game's own settings (settings.ini) - the same as in the game's Options menu. They apply the next time the game starts."));
+        else if (optionsGroup.equals("PERFORMANCE"))
+            list.addView(note("For smooth play: Resolution 540p or 720p, Async pipelines ON, Async shaders ON, Big cores ON. "
+                + "The first match on each stage builds its shaders once; later starts load them."));
+        for (Settings.Opt o : Settings.ALL) if (o.group.equals(optionsGroup)) list.addView(optionRow(o, ini), llp(-1, -2, 6));
+        if (optionsGroup.equals("DEBUG")) {
+            list.addView(actionRow("CUSTOM VARIABLES", "Any other runtime switch, one NAME=VALUE per line (advanced).", this::editCustom), llp(-1, -2, 6));
+        }
+    }
+
+    private TextView note(String s) {
+        TextView t = text(s, 11, STEEL, regular);
+        t.setLineSpacing(0, 1.15f);
+        t.setPadding(dp(6), dp(2), dp(6), dp(6));
+        return t;
+    }
+
+    private View optionRow(Settings.Opt o, LinkedHashMap<String, LinkedHashMap<String, String>> ini) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14), dp(8), dp(10), dp(8));
+        row.setBackground(panel(175));
+        row.setFocusable(true);
+        LinearLayout labels = new LinearLayout(this);
+        labels.setOrientation(LinearLayout.VERTICAL);
+        TextView name = text(o.label.toUpperCase(java.util.Locale.ROOT), 14.5f, SILVER, semi);
+        name.setLetterSpacing(0.06f);
+        labels.addView(name);
+        TextView help = text(o.help, 10.5f, STEEL, regular);
+        help.setPadding(0, dp(3), dp(10), 0);
+        labels.addView(help);
+        row.addView(labels, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        final int[] idx = { o.index(Settings.get(this, o, ini)) };
+        TextView left = text("◀", 14, RED, bold);
+        left.setPadding(dp(10), dp(6), dp(10), dp(6));
+        TextView value = text(o.labels[idx[0]], 14, Color.WHITE, bold);
+        value.setGravity(Gravity.CENTER);
+        value.setMinWidth(dp(132));
+        TextView right = text("▶", 14, RED, bold);
+        right.setPadding(dp(10), dp(6), dp(10), dp(6));
+        row.addView(left); row.addView(value); row.addView(right);
+
+        Runnable apply = () -> {
+            Settings.set(this, o, o.values[idx[0]], ini);
+            value.setText(o.labels[idx[0]]);
+            if (!noAnim()) {
+                value.setScaleX(1.18f); value.setScaleY(1.18f); value.setAlpha(0.4f);
+                value.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(220).setInterpolator(new DecelerateInterpolator()).start();
+            }
+            if (o.key.equals("no_anim")) { if (noAnim()) stopLoops(); else startLoops(); }
+        };
+        left.setOnClickListener(v -> { idx[0] = (idx[0] + o.values.length - 1) % o.values.length; apply.run(); });
+        right.setOnClickListener(v -> { idx[0] = (idx[0] + 1) % o.values.length; apply.run(); });
+        row.setOnClickListener(v -> { idx[0] = (idx[0] + 1) % o.values.length; apply.run(); });
+        row.setOnKeyListener((v, code, ev) -> {
+            if (ev.getAction() != KeyEvent.ACTION_DOWN) return false;
+            if (code == KeyEvent.KEYCODE_DPAD_LEFT) { idx[0] = (idx[0] + o.values.length - 1) % o.values.length; apply.run(); return true; }
+            if (code == KeyEvent.KEYCODE_DPAD_RIGHT) { idx[0] = (idx[0] + 1) % o.values.length; apply.run(); return true; }
+            return false;
+        });
+        row.setOnFocusChangeListener((v, f) -> row.setBackground(f ? focusPanel() : panel(175)));
+        tapFeedback(left); tapFeedback(right);
+        return row;
+    }
+
+    private GradientDrawable focusPanel() {
+        GradientDrawable g = panel(200);
+        g.setStroke(dp(2), RED);
+        return g;
+    }
+
+    private View actionRow(String title, String help, Runnable action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14), dp(10), dp(14), dp(10));
+        row.setBackground(panel(175));
+        row.setFocusable(true);
+        LinearLayout labels = new LinearLayout(this);
+        labels.setOrientation(LinearLayout.VERTICAL);
+        TextView name = text(title, 14.5f, SILVER, semi);
+        name.setLetterSpacing(0.06f);
+        labels.addView(name);
+        TextView h = text(help, 10.5f, STEEL, regular);
+        h.setPadding(0, dp(3), 0, 0);
+        labels.addView(h);
+        row.addView(labels, new LinearLayout.LayoutParams(0, -2, 1f));
+        row.addView(text("▶", 14, RED, bold));
+        row.setOnClickListener(v -> action.run());
+        row.setOnFocusChangeListener((v, f) -> row.setBackground(f ? focusPanel() : panel(175)));
+        tapFeedback(row);
+        return row;
+    }
+
+    private void fillTools(LinearLayout list) {
+        list.addView(note("Game folder, saves and logs: " + dataRoot(this) + "\nSaves: TTT2Recomp/saves   Log: TTT2Recomp/log.txt"));
+        list.addView(actionRow(installed() ? "REINSTALL GAME" : "INSTALL GAME", "Builds the game folder again from the chosen ISO and Title Update.", this::startInstall), llp(-1, -2, 6));
+        list.addView(actionRow("LOGS", "The crash report, the start of the log, important lines and the end.", this::showLog), llp(-1, -2, 6));
+        list.addView(actionRow("FRAMES", "The frames saved by DEBUG -> SAVE FRAMES.", this::showFrames), llp(-1, -2, 6));
+        list.addView(actionRow("EXPORT DEBUG", "Logs, frames and failed shaders as Download/ttt2-debug-<time>.zip, to attach to a report.", this::exportDebug), llp(-1, -2, 6));
+        list.addView(actionRow("CLEAR SHADER CACHE", "Deletes the compiled shaders and the Vulkan pipeline cache (they are built again while playing).", this::clearShaderCache), llp(-1, -2, 6));
+        list.addView(actionRow("RESET ALL OPTIONS", "Every option back to its default (custom variables are kept).", () ->
+            new AlertDialog.Builder(this).setTitle("Reset all options?").setPositiveButton("Reset", (d, w) -> {
+                Settings.resetAll(this);
+                toastStatus("Options reset to the defaults.");
+            }).setNegativeButton("Cancel", null).show()), llp(-1, -2, 6));
+    }
+
+    private void editCustom() {
+        EditText e = new EditText(this);
+        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        e.setTypeface(Typeface.MONOSPACE);
+        e.setMinLines(5);
+        e.setText(prefs.getString("env_custom", ""));
+        e.setHint("TTT2_EXAMPLE=1");
+        new AlertDialog.Builder(this).setTitle("Custom variables").setView(e)
+            .setPositiveButton("Save", (d, w) -> prefs.edit().putString("env_custom", e.getText().toString()).apply())
+            .setNegativeButton("Cancel", null).show();
+    }
+
+    private void clearShaderCache() {
+        File root = new File(dataRoot(this));
+        int n = 0;
+        for (File d : new File[] { new File(root, "TTT2Recomp"), new File(root, "TTT2Recomp/shadercache"), new File(root, "ttt2/port/shadercache-debug") }) {
+            File[] files = d.listFiles();
+            if (files == null) continue;
+            for (File f : files) {
+                String s = f.getName();
+                if (f.isFile() && (s.endsWith(".dxbc") || s.endsWith(".dxvk-cache") || s.endsWith(".bin")) && f.delete()) n++;
+            }
+        }
+        toastStatus("Shader cache cleared (" + n + " files).");
+    }
+
+    private void toastStatus(String s) {
+        android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_SHORT).show();
+        if (status != null) status.setText(s);
+    }
+
+    // ================================================================ CREDITS
+    private View buildCredits() {
+        ScrollView sv = new ScrollView(this);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(4), dp(4), dp(4), dp(24));
+        sv.addView(col);
+
+        // Port author.
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        top.setPadding(dp(16), dp(14), dp(16), dp(14));
+        top.setBackground(panel(185));
+        LinearLayout me = new LinearLayout(this);
+        me.setOrientation(LinearLayout.VERTICAL);
+        TextView by = text("ANDROID PORT BY", 10, RED, semi);
+        by.setLetterSpacing(0.25f);
+        me.addView(by);
+        me.addView(text(Credits.PORT_BY, 24, Color.WHITE, bold));
+        TextView gh = link(Credits.GITHUB, "https://" + Credits.GITHUB);
+        me.addView(gh);
+        top.addView(me, new LinearLayout.LayoutParams(0, -2, 1f));
+        col.addView(top);
+
+        // Catonix with the profile photo.
+        LinearLayout cat = new LinearLayout(this);
+        cat.setOrientation(LinearLayout.HORIZONTAL);
+        cat.setGravity(Gravity.CENTER_VERTICAL);
+        cat.setPadding(dp(16), dp(14), dp(16), dp(14));
+        cat.setBackground(panel(185));
+        cat.addView(catonixPhoto(), new LinearLayout.LayoutParams(dp(74), dp(74)));
+        LinearLayout cc = new LinearLayout(this);
+        cc.setOrientation(LinearLayout.VERTICAL);
+        cc.setPadding(dp(16), 0, 0, 0);
+        TextView sp = text("SPECIAL THANKS", 10, RED, semi);
+        sp.setLetterSpacing(0.25f);
+        cc.addView(sp);
+        cc.addView(text(Credits.CATONIX, 22, Color.WHITE, bold));
+        LinearLayout links = new LinearLayout(this);
+        links.setOrientation(LinearLayout.HORIZONTAL);
+        for (String[] l : Credits.CATONIX_LINKS) {
+            TextView b = text(l[0], 11.5f, Color.WHITE, semi);
+            b.setLetterSpacing(0.12f);
+            b.setPadding(dp(16), dp(6), dp(14), dp(6));
+            b.setBackground(new Plate(dp(8), Color.argb(190, 150, 12, 24), Color.rgb(255, 90, 90)));
+            b.setFocusable(true);
+            b.setOnClickListener(v -> open(l[1]));
+            tapFeedback(b);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+            lp.rightMargin = dp(8);
+            lp.topMargin = dp(6);
+            links.addView(b, lp);
+        }
+        cc.addView(links);
+        cat.addView(cc, new LinearLayout.LayoutParams(0, -2, 1f));
+        col.addView(cat, llp(-1, -2, 8));
+
+        // Everyone else.
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(16), dp(12), dp(16), dp(12));
+        list.setBackground(panel(175));
+        for (String[] t : Credits.THANKS) {
+            TextView h = text(t[0].toUpperCase(java.util.Locale.ROOT), 12.5f, SILVER, semi);
+            h.setLetterSpacing(0.08f);
+            list.addView(h, llp(-1, -2, list.getChildCount() == 0 ? 0 : 10));
+            TextView d = text(t[1], 11.5f, STEEL, regular);
+            d.setPadding(0, dp(2), 0, 0);
+            list.addView(d);
+        }
+        col.addView(list, llp(-1, -2, 8));
+
+        TextView disc = text(Credits.DISCLAIMER, 10.5f, STEEL, regular);
+        disc.setLineSpacing(0, 1.15f);
+        disc.setPadding(dp(6), 0, dp(6), 0);
+        col.addView(disc, llp(-1, -2, 12));
+
+        if (!noAnim()) {
+            for (int i = 0; i < col.getChildCount(); i++) {
+                View v = col.getChildAt(i);
+                v.setAlpha(0f);
+                v.setTranslationY(dp(18));
+                v.animate().alpha(1f).translationY(0).setStartDelay(160 + i * 70L).setDuration(300).setInterpolator(new DecelerateInterpolator()).start();
+            }
+        }
+        return page("CREDITS", sv);
+    }
+
+    /** Catonix's profile photo (res/drawable-nodpi/catonix.jpg/.png when present), round; else a round badge. */
+    private View catonixPhoto() {
+        int id = getResources().getIdentifier("catonix", "drawable", getPackageName());
+        View v;
+        if (id != 0) {
+            ImageView iv = new ImageView(this);
+            iv.setImageResource(id);
+            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            v = iv;
+        } else {
+            TextView t = text("C", 34, Color.WHITE, bold);
+            t.setGravity(Gravity.CENTER);
+            GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[] { RED, RED_DARK });
+            g.setShape(GradientDrawable.OVAL);
+            t.setBackground(g);
+            v = t;
+        }
+        v.setOutlineProvider(new ViewOutlineProvider() {
+            @Override public void getOutline(View view, Outline o) { o.setOval(0, 0, view.getWidth(), view.getHeight()); }
+        });
+        v.setClipToOutline(true);
+        v.setForeground(ring());
+        return v;
+    }
+
+    private GradientDrawable ring() {
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setStroke(dp(2), RED);
+        return g;
+    }
+
+    private TextView link(String label, String url) {
+        TextView t = text(label, 12, BLUE, regular);
+        t.setPadding(0, dp(3), 0, 0);
+        t.setFocusable(true);
+        t.setOnClickListener(v -> open(url));
+        return t;
+    }
+
+    private void open(String url) {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+        catch (Exception e) { toastStatus("No app can open " + url); }
+    }
+
+    // ================================================================ state
     private void refresh() {
-        isoText.setText(nameOf(prefs.getString("iso", null), "not chosen"));
-        tuText.setText(nameOf(prefs.getString("tu", null), "not chosen"));
+        if (playItem == null) return;
         boolean ok = installed();
-        playButton.setEnabled(ok && !installing);
-        playButton.setAlpha(ok && !installing ? 1f : 0.4f);
-        installButton.setEnabled(!installing && prefs.getString("iso", null) != null && prefs.getString("tu", null) != null);
-        installButton.setAlpha(installButton.isEnabled() ? 1f : 0.4f);
-        installButton.setText(ok ? "3. Reinstall" : "3. Install");
-        isoButton.setEnabled(!installing);
-        tuButton.setEnabled(!installing);
-        cancelButton.setVisibility(installing ? View.VISIBLE : View.GONE);
+        String iso = prefs.getString("iso", null), tu = prefs.getString("tu", null);
+        isoItem.setSub(iso == null ? "NOT CHOSEN" : nameOf(iso, ""));
+        tuItem.setSub(tu == null ? "NOT CHOSEN" : nameOf(tu, ""));
+        playItem.setSub(installing ? "INSTALLING..." : ok ? "READY" : iso != null && tu != null ? "TAP TO INSTALL" : "SELECT ISO AND TITLE UPDATE FIRST");
+        playItem.setAlpha(installing ? 0.5f : 1f);
+        isoItem.setEnabled(!installing);
+        tuItem.setEnabled(!installing);
         if (!installing && status.getText().length() == 0)
-            status.setText(ok ? "Game installed. Press PLAY." : "Choose your disc image and Title Update 3, then Install (about 10 GB free space needed).");
-        info.setText("Game folder, saves and logs: " + dataRoot(this) + "\nLog: TTT2Recomp/log.txt   DXVK logs: TTT2Recomp/*.log");
+            status.setText(ok ? "Game installed." : "Choose your disc image and Title Update 3 (about 10 GB free space needed).");
     }
 
     private String nameOf(String uri, String fallback) {
@@ -240,6 +875,7 @@ public class LauncherActivity extends Activity {
     }
 
     private void pick(int code) {
+        if (installing) return;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         i.setType("*/*");
@@ -256,13 +892,74 @@ public class LauncherActivity extends Activity {
         prefs.edit().putString(request == PICK_ISO ? "iso" : "tu", uri.toString()).apply();
         status.setText("");
         refresh();
+        // Both chosen and nothing installed yet: offer the install straight away.
+        if (!installed() && prefs.getString("iso", null) != null && prefs.getString("tu", null) != null)
+            new AlertDialog.Builder(this).setTitle("Install the game?")
+                .setMessage("Builds the game folder from your disc image and Title Update 3 (about 10 GB free space, several minutes).")
+                .setPositiveButton("Install", (d, w) -> startInstall()).setNegativeButton("Later", null).show();
     }
 
-    // ---------------------------------------------------------------- install
+    // ================================================================ install
+    private View buildInstallPanel() {
+        FrameLayout f = new FrameLayout(this);
+        f.setClickable(true);
+        View shade = new View(this);
+        shade.setBackgroundColor(Color.argb(200, 4, 3, 8));
+        f.addView(shade, flp(-1, -1, Gravity.FILL));
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(26), dp(20), dp(26), dp(18));
+        card.setBackground(panel(235));
+        TextView t = text("INSTALLING", 22, Color.WHITE, bold);
+        t.setLetterSpacing(0.12f);
+        card.addView(t);
+        installText = text("", 12, STEEL, regular);
+        card.addView(installText, llp(-1, -2, 8));
+        installBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        installBar.setMax(100);
+        installBar.setProgressTintList(android.content.res.ColorStateList.valueOf(RED));
+        card.addView(installBar, llp(-1, dp(8), 10));
+        TextView cancelB = text("CANCEL", 13, Color.WHITE, semi);
+        cancelB.setLetterSpacing(0.12f);
+        cancelB.setPadding(dp(20), dp(7), dp(18), dp(7));
+        cancelB.setBackground(new Plate(dp(9), Color.argb(200, 60, 10, 16), RED));
+        cancelB.setFocusable(true);
+        cancelB.setOnClickListener(v -> { cancel = true; installText.setText("Cancelling..."); });
+        tapFeedback(cancelB);
+        LinearLayout.LayoutParams cp = llp(-2, -2, 14);
+        cp.gravity = Gravity.END;
+        card.addView(cancelB, cp);
+        f.addView(card, flp(dp(460), -2, Gravity.CENTER));
+        return f;
+    }
+
+    private void showInstallPanel(boolean show) {
+        if (noAnim()) { installPanel.setVisibility(show ? View.VISIBLE : View.GONE); installPanel.setAlpha(1f); return; }
+        if (show) {
+            installPanel.setVisibility(View.VISIBLE);
+            installPanel.setAlpha(0f);
+            installPanel.setScaleX(1.04f); installPanel.setScaleY(1.04f);
+            installPanel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(260).setListener(null).start();
+        } else {
+            installPanel.animate().alpha(0f).setDuration(220).setListener(new AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(Animator a) { installPanel.animate().setListener(null); installPanel.setVisibility(View.GONE); }
+            }).start();
+        }
+    }
+
     private void startInstall() {
+        if (installing) return;
+        if (prefs.getString("iso", null) == null || prefs.getString("tu", null) == null) {
+            toastStatus("Select your ISO and Title Update first.");
+            return;
+        }
         installing = true;
         cancel = false;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (current != home) goHome();
+        installText.setText("Starting...");
+        installBar.setProgress(0);
+        showInstallPanel(true);
         refresh();
         new Thread(() -> {
             String error;
@@ -271,7 +968,7 @@ public class LauncherActivity extends Activity {
                 if (iso == null || tu == null) throw new Exception("Could not open the chosen files.");
                 error = Native.install("/proc/self/fd/" + iso.getFd(), "/proc/self/fd/" + tu.getFd(), dataRoot(this), new Native.Listener() {
                     @Override public void progress(int percent, String text) {
-                        runOnUiThread(() -> { progress.setProgress(percent); status.setText(text); });
+                        runOnUiThread(() -> { installBar.setProgress(percent); installText.setText(text); });
                     }
                     @Override public boolean cancelled() { return cancel; }
                 });
@@ -282,16 +979,36 @@ public class LauncherActivity extends Activity {
             runOnUiThread(() -> {
                 installing = false;
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                if (err == null) { progress.setProgress(100); status.setText("Installed. Press PLAY."); }
-                else status.setText("Install failed: " + err);
+                showInstallPanel(false);
+                status.setText(err == null ? "Installed. Press PLAY." : "Install failed: " + err);
                 refresh();
             });
         }, "ttt2-install").start();
     }
 
     private void play() {
-        startActivity(new Intent(this, GameActivity.class));
+        if (installing) return;
+        if (!installed()) {
+            if (prefs.getString("iso", null) != null && prefs.getString("tu", null) != null) startInstall();
+            else toastStatus("Select your ISO and Title Update first.");
+            return;
+        }
+        if (noAnim()) { startActivity(new Intent(this, GameActivity.class)); return; }
+        // A short flash out before the game takes over.
+        root.animate().alpha(0f).setDuration(240).setListener(new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator a) {
+                root.animate().setListener(null);
+                startActivity(new Intent(LauncherActivity.this, GameActivity.class));
+                overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
+                root.postDelayed(() -> root.setAlpha(1f), 600);
+            }
+        }).start();
     }
+
+    // ================================================================ logs, frames, export (unchanged)
+    private TextView label(String s, float size, int color) { return text(s, size, color, Typeface.DEFAULT); }
+
+    private LinearLayout.LayoutParams lp(int top) { return llp(-1, -2, top); }
 
     private static String tail(File f, int max) {
         if (!f.isFile()) return null;
@@ -383,9 +1100,9 @@ public class LauncherActivity extends Activity {
                 zipDir(z, new File(dataRoot(this), "TTT2Recomp"), "TTT2Recomp/", 40_000_000L);
                 zipDir(z, new File(dataRoot(this), "ttt2/port"), "ttt2/port/", 40_000_000L);
             }
-            status.setText("Saved Download/" + name + " - attach it to your message.");
+            toastStatus("Saved Download/" + name + " - attach it to your message.");
         } catch (Exception e) {
-            status.setText("Export failed: " + e);
+            toastStatus("Export failed: " + e);
         }
     }
 
@@ -451,9 +1168,4 @@ public class LauncherActivity extends Activity {
             .setNegativeButton("Close", null).show();
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-        refresh();
-    }
 }

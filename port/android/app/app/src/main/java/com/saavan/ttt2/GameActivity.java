@@ -23,6 +23,7 @@ public class GameActivity extends SDLActivity {
         a.add("--root"); a.add(LauncherActivity.dataRoot(this));
         if (p.getBoolean("fbdump", false)) a.add("--fbdump");
         if (p.getBoolean("cpu", false)) a.add("--cpu");
+        a.addAll(Settings.envArgs(this));     // r22: launcher OPTIONS (runtime switches)
         return a.toArray(new String[0]);
     }
 
@@ -35,6 +36,34 @@ public class GameActivity extends SDLActivity {
             mLayout.addView(overlay, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         }
         hideSystemBars();
+        applyPerformanceMode();
+    }
+
+    /** r22: steady clocks (sustained performance mode) and a 60 Hz display while the game runs (OPTIONS -> PERFORMANCE). */
+    private void applyPerformanceMode() {
+        android.content.SharedPreferences p = getSharedPreferences("ttt2", MODE_PRIVATE);
+        if (p.getBoolean("sustained", true)) {
+            try {
+                android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+                if (pm != null && pm.isSustainedPerformanceModeSupported()) getWindow().setSustainedPerformanceMode(true);
+            } catch (Throwable ignored) {}
+        }
+        if (p.getBoolean("fps60", true)) {
+            try {
+                // The display mode closest to 60 Hz at the current size (90/120 Hz screens pace 60 fps unevenly).
+                android.view.Display d = getWindowManager().getDefaultDisplay();
+                android.view.Display.Mode cur = d.getMode(), best = null;
+                for (android.view.Display.Mode m : d.getSupportedModes()) {
+                    if (m.getPhysicalWidth() != cur.getPhysicalWidth() || m.getPhysicalHeight() != cur.getPhysicalHeight()) continue;
+                    if (best == null || Math.abs(m.getRefreshRate() - 60f) < Math.abs(best.getRefreshRate() - 60f)) best = m;
+                }
+                if (best != null && Math.abs(best.getRefreshRate() - 60f) < 1f) {
+                    WindowManager.LayoutParams lp = getWindow().getAttributes();
+                    lp.preferredDisplayModeId = best.getModeId();
+                    getWindow().setAttributes(lp);
+                }
+            } catch (Throwable ignored) {}
+        }
     }
 
     @Override

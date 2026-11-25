@@ -7,6 +7,7 @@
 // Layout under it, as the PC installer's game folder:
 //   game/tekken.img, game/data*.bin, ...   (built by the installer from the player's disc + TU3)
 //   TTT2Recomp/log.txt                     (the game's log; saves and settings next to it)
+#include "android_affinity.h"
 #include <SDL.h>
 #include <jni.h>
 #include <cstdint>
@@ -167,6 +168,13 @@ extern "C" int SDL_main(int argc, char* argv[])
         // Launcher "Renderer: CPU": the game's software renderer (kernel_video.cpp / gpu_render.cpp) instead of
         // D3D11 -> DXVK; slow, but it shows whether a black screen comes from the GPU path or from the game itself.
         if (std::strcmp(argv[i], "--cpu") == 0) { setenv("TTT2_GPU_HW", "0", 1); setenv("TTT2_FBDUMP", "1", 1); }
+        // r22: launcher Options - "--set NAME=VALUE" pairs, set before (so over) every default below.
+        if (i + 1 < argc && std::strcmp(argv[i], "--set") == 0)
+        {
+            const std::string kv = argv[i + 1];
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos && eq > 0) setenv(kv.substr(0, eq).c_str(), kv.substr(eq + 1).c_str(), 1);
+        }
     }
     // Launcher "Debug: save frames": the rendered frame and the window's back buffer as BMPs once a
     // second (gpu_hw_d3d11.h TTT2_FB_NATIVE) in <root>/ttt2/port, shown by the launcher's Frames button.
@@ -216,6 +224,7 @@ extern "C" int SDL_main(int argc, char* argv[])
     setDefault("DXVK_LOG_LEVEL", "warn");
     setDefault("DXVK_STATE_CACHE_PATH", root + "/TTT2Recomp");
     setDefault("DXVK_HUD", "0");
+    setDefault("DXVK_ASYNC", "1");                         // r22: pipelines built in the background (dxvk-async)
     // The log is written directly, not through the PC build's pipe + writer thread: a crash right
     // after start must still leave every line in log.txt.
     setDefault("TTT2_LOG_ASYNC", "0");
@@ -236,12 +245,15 @@ extern "C" int SDL_main(int argc, char* argv[])
     args.push_back(self);
     for (int i = 1; i < argc; ++i)
     {
-        if (std::strcmp(argv[i], "--root") == 0) { ++i; continue; }
+        if (std::strcmp(argv[i], "--root") == 0 || std::strcmp(argv[i], "--set") == 0) { ++i; continue; }
         if (std::strcmp(argv[i], "--fbdump") == 0 || std::strcmp(argv[i], "--cpu") == 0) continue;
         args.push_back(argv[i]);
     }
     args.push_back(nullptr);
     Ttt2SetCommandLine(int(args.size() - 1), args.data());
+#ifdef __ANDROID__
+    ttt2_affinity::GameThread();       // r22: the game's main thread on the big cores
+#endif
     const int rc = ttt2_main(int(args.size() - 1), args.data());
     std::fprintf(stderr, "[android] game main returned %d\n", rc);
     std::fflush(stderr);

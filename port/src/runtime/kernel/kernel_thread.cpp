@@ -1,5 +1,6 @@
 // Guest threads: ExCreateThread spawns a real host thread that sets up its own PCR/TLS/TEB/stack
 // and runs the guest start routine. Layout ported from Unleashed's GuestThreadContext.
+#include "android_affinity.h"
 #include "kernel_shared.h"
 #include "kernel_trace.h"
 #include "guest_heap.h"
@@ -413,6 +414,9 @@ uint32_t SetupThreadBlock(uint32_t threadId, uint32_t& stackTopOut)
     stackTopOut = g + TOTAL;
     const DWORD tid = GetCurrentThreadId();
     const uint32_t entry = KernelGuestThreadEntry(tid);
+#ifdef __ANDROID__
+    ttt2_affinity::GameThread();       // r22: the game's own threads on the big cores
+#endif
     if (tracked)
     {
         static std::atomic<int> trackedLines{ 0 };

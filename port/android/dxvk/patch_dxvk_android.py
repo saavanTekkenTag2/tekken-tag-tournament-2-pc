@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Android/ARM64 changes to dxvk-native 1.9.2b (Joshua-Ashton/dxvk-native, tag native-1.9.2b).
 Idempotent: run on the source tree before building.  Usage: patch_dxvk_android.py <dxvk-native dir>"""
-import pathlib, sys
+import pathlib, subprocess, sys
 
 root = pathlib.Path(sys.argv[1])
 PATCHES = [
@@ -104,3 +104,15 @@ def apply(rel, old, new):
 
 for rel, old, new in PATCHES:
     print(apply(rel, old, new))
+
+# r22: asynchronous pipeline compilation (Sporif/dxvk-async, regenerated for 1.9.2b). A draw whose
+# pipeline is not built yet is skipped for a frame or two instead of the whole frame stalling on
+# the Vulkan driver's compile; only for render targets drawn to in the last 5 frames. DXVK_ASYNC=1
+# or dxvk.enableAsync turns it on.
+ASYNC = pathlib.Path(__file__).with_name("dxvk-async.patch")
+if (root / "src/dxvk/dxvk_pipecompiler.h").exists():
+    print("dxvk-async: already patched")
+else:
+    if subprocess.run(["patch", "-p1", "-N", "-s", "-d", str(root), "-i", str(ASYNC)]).returncode != 0:
+        sys.exit("dxvk-async: patch failed")
+    print("dxvk-async: patched")

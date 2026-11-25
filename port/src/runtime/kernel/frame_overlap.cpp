@@ -33,6 +33,7 @@
 // changes the guard would have missed).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include "android_affinity.h"
 #include <windows.h>
 #include "kernel_shared.h"
 #include "guest_heap.h"
@@ -693,7 +694,13 @@ void AfterKickWait(uint32_t fence)
 // The kick's device (diag_hooks.cpp sub_82738DA0 from the kick): for the fence test.
 void NoteDevice(uint32_t device) { g_device.store(device, std::memory_order_release); }
 // Command processor threads (kernel_video.cpp): never wait in the guard.
-void MarkCpThread() { t_cpThread = true; }
+void MarkCpThread()
+{
+    t_cpThread = true;
+#ifdef __ANDROID__
+    ttt2_affinity::GameThread();       // r22: the command processor on the big cores
+#endif
+}
 
 // The command processor read guest memory (kernel_video.cpp GpuNoteMemory): kind 1 vertex, 2 index, 3 constants;
 // or (kicked) the pre-scan found memory the frame just kicked reads.

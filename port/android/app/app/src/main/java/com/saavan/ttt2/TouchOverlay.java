@@ -47,11 +47,16 @@ public class TouchOverlay extends View {
         text.setTextAlign(Paint.Align.CENTER);
         text.setFakeBoldText(true);
         setFocusable(false);
+        // r22: Options -> Controls: opacity and size of the on-screen pad.
+        android.content.SharedPreferences p = c.getSharedPreferences("ttt2", Context.MODE_PRIVATE);
+        setAlpha(Math.max(0.15f, Math.min(1f, p.getInt("touch_alpha", 100) / 100f)));
+        sizeScale = Math.max(0.6f, Math.min(1.5f, p.getInt("touch_size", 100) / 100f));
     }
+    private float sizeScale = 1f;
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
-        float u = Math.min(w, h) / 10f;
+        float u = Math.min(w, h) / 10f * sizeScale;
         stickR = u * 1.7f;
         stickCx = u * 2.4f; stickCy = h - u * 2.5f;
         knobX = stickCx; knobY = stickCy;
