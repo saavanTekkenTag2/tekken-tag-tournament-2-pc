@@ -64,7 +64,37 @@ PPC_FUNC(__imp__RtlNtStatusToDosError)
     using StatusToDosError = ULONG (NTAPI*)(LONG);
     static const StatusToDosError convert = reinterpret_cast<StatusToDosError>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
-    ctx.r3.u32 = convert ? convert(static_cast<LONG>(ctx.r3.u32)) : ERROR_MR_MID_NOT_FOUND;
+    const uint32_t status = ctx.r3.u32;
+    if (convert) { ctx.r3.u32 = convert(static_cast<LONG>(status)); return; }
+    // No ntdll (Android): Windows' mapping for the statuses the game and XAPI can see. MEASURED 2026-11-25 (Android
+    // r14/r15 traces): every status came back ERROR_MR_MID_NOT_FOUND, so XAPI's ReadFile reported the XMV player's read
+    // past the end of data047.bin as an unknown failure instead of ERROR_HANDLE_EOF; the player tore down and the game
+    // froze on the title movie after the opening movie was skipped.
+    static const struct { uint32_t status, error; } kMap[] = {
+        { 0x00000000u, 0 },    { 0x00000103u, 997 },  { 0x00000102u, 258 },  { 0x00000101u, 0 },    { 0x00000080u, 0 },
+        { 0x80000005u, 234 },  { 0x80000006u, 18 },   { 0x8000001Au, 259 },  { 0x80000011u, 170 },
+        { 0xC0000001u, 31 },   { 0xC0000002u, 1 },    { 0xC0000004u, 24 },   { 0xC0000005u, 998 },  { 0xC0000008u, 6 },
+        { 0xC000000Du, 87 },   { 0xC000000Eu, 2 },    { 0xC000000Fu, 2 },    { 0xC0000010u, 1 },    { 0xC0000011u, 38 },
+        { 0xC0000013u, 21 },   { 0xC0000017u, 8 },    { 0xC000001Du, 1 },    { 0xC0000022u, 5 },    { 0xC0000023u, 122 },
+        { 0xC0000024u, 6 },    { 0xC0000033u, 123 },  { 0xC0000034u, 2 },    { 0xC0000035u, 183 },  { 0xC000003Au, 3 },
+        { 0xC000003Bu, 161 },  { 0xC0000043u, 32 },   { 0xC000004Au, 156 },  { 0xC0000054u, 33 },   { 0xC0000056u, 5 },
+        { 0xC000007Fu, 112 },  { 0xC000009Au, 1450 }, { 0xC000009Cu, 23 },   { 0xC00000A3u, 21 },   { 0xC00000B5u, 121 },
+        { 0xC00000BAu, 5 },    { 0xC00000BBu, 50 },   { 0xC00000E5u, 1359 }, { 0xC00000EFu, 87 },   { 0xC0000101u, 145 },
+        { 0xC0000102u, 1392 }, { 0xC0000103u, 267 },  { 0xC0000120u, 995 },  { 0xC0000185u, 1117 }, { 0xC000000Cu, 31 },
+    };
+    uint32_t error = ERROR_MR_MID_NOT_FOUND;
+    bool found = false;
+    for (const auto& m : kMap)
+        if (m.status == status) { error = m.error; found = true; break; }
+    if (!found && (status & 0xFFFF0000u) == 0xC0070000u) error = status & 0xFFFFu;   // FACILITY_WIN32 statuses
+    else if (!found && (status & 0xFFFF0000u) == 0x80070000u) error = status & 0xFFFFu;
+    if (!found)
+    {
+        static std::atomic<int> unknownLogs{ 0 };
+        if (unknownLogs.fetch_add(1, std::memory_order_relaxed) < 20)
+            std::fprintf(stderr, "[kernel] RtlNtStatusToDosError: status %08X not in the table -> %u\n", status, error);
+    }
+    ctx.r3.u32 = error;
 }
 
 // --- memory statistics: fill the guest MM_STATISTICS struct with plausible values ---

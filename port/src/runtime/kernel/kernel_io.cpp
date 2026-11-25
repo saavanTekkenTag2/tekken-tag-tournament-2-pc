@@ -552,7 +552,9 @@ PPC_FUNC(__imp__NtReadFile)
     // XAPI's ReadFile failed it on the spot (RtlNtStatusToDosError at 82BFC1F8), the player took that as a fatal error -
     // its threads suspended themselves and the main thread waited for good at 8277F090 after the opening movie was
     // skipped. TTT2_EOF_PENDING=0: the immediate status as before.
-    static const bool eofPending = [] { const char* e = std::getenv("TTT2_EOF_PENDING"); return !(e && e[0] == '0'); }();
+    // Off by default since r16: the cause was RtlNtStatusToDosError (no ntdll on Android), not the immediate status -
+    // with ERROR_HANDLE_EOF the player ends its stream as on Windows. TTT2_EOF_PENDING=1: pending as in r15.
+    static const bool eofPending = [] { const char* e = std::getenv("TTT2_EOF_PENDING"); return e && e[0] == '1'; }();
     if (status == STATUS_END_OF_FILE && eofPending && (event || apcRoutine))
     {
         static std::atomic<uint32_t> pendLog{0};
