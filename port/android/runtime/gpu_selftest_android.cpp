@@ -14,6 +14,9 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#ifdef TTT2_NATIVE_VK
+#include "../vk/ttt2vk.h"
+#endif
 
 #include <cstdarg>
 #include <cstdlib>
@@ -179,11 +182,25 @@ extern "C" void Ttt2GpuSelfTest(const char* root)
 {
     const std::string path = std::string(root) + "/TTT2Recomp/gpu_selftest.txt";
     g_out = std::fopen(path.c_str(), "w");
-    Log("[gpu-selftest] D3D11 (DXVK) + D3DCompile (vkd3d-shader)\n");
     Ctx c;
     const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL fl{};
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2, D3D11_SDK_VERSION, &c.dev, &fl, &c.ctx);
+    HRESULT hr = E_FAIL;
+#ifdef TTT2_NATIVE_VK
+    // r24: the native renderer (TTT2_RENDERER=native) is tested instead of DXVK - the same jobs, the same answers.
+    if (Ttt2VkRequested())
+    {
+        Log("[gpu-selftest] D3D11 on the NATIVE Vulkan renderer (ttt2vk) + D3DCompile (vkd3d-shader)\n");
+        hr = Ttt2VkCreateDevice(&c.dev, &c.ctx);
+        fl = D3D_FEATURE_LEVEL_11_0;
+        if (FAILED(hr)) Log("  the native renderer could not start - the game uses DXVK\n");
+    }
+#endif
+    if (!c.dev)
+    {
+        Log("[gpu-selftest] D3D11 (DXVK) + D3DCompile (vkd3d-shader)\n");
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2, D3D11_SDK_VERSION, &c.dev, &fl, &c.ctx);
+    }
     if (FAILED(hr)) { Log("  D3D11CreateDevice failed %08X\n", unsigned(hr)); if (g_out) std::fclose(g_out); g_out = nullptr; return; }
     {
         ComPtr<IDXGIDevice> dxgi; ComPtr<IDXGIAdapter> ad; DXGI_ADAPTER_DESC desc{};

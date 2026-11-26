@@ -22,6 +22,9 @@
 #include "gpu_fps_overlay.h"
 #include "log_utf8.h"
 #include "android_affinity.h"
+#ifdef TTT2_NATIVE_VK
+#include "../../../android/vk/ttt2vk.h"
+#endif
 #include <d3d11_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -541,11 +544,25 @@ public:
             flags |= D3D11_CREATE_DEVICE_DEBUG;
         const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         D3D_FEATURE_LEVEL actual{};
-        const ComPtr<IDXGIAdapter1> preferred = PreferredGpuAdapter();
-        HRESULT created = D3D11CreateDevice(preferred.Get(), preferred ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-                                            levels, 2, D3D11_SDK_VERSION, &device_, &actual, &context_);
-        if (FAILED(created) && preferred)               // that adapter refused: the default one, as before
-            created = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2, D3D11_SDK_VERSION, &device_, &actual, &context_);
+        HRESULT created = E_FAIL;
+#ifdef TTT2_NATIVE_VK
+        // r24: the native renderer (port/android/vk: D3D11 directly on Vulkan, no DXVK) when chosen in the launcher;
+        // DXVK when it cannot start.
+        if (Ttt2VkRequested())
+        {
+            created = Ttt2VkCreateDevice(&device_, &context_);
+            actual = D3D_FEATURE_LEVEL_11_0;
+            std::fprintf(stderr, "[gpu-hw] native Vulkan renderer: %s\n", SUCCEEDED(created) ? "on" : "could not start - DXVK instead");
+        }
+        if (FAILED(created))
+#endif
+        {
+            const ComPtr<IDXGIAdapter1> preferred = PreferredGpuAdapter();
+            created = D3D11CreateDevice(preferred.Get(), preferred ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+                                        levels, 2, D3D11_SDK_VERSION, &device_, &actual, &context_);
+            if (FAILED(created) && preferred)               // that adapter refused: the default one, as before
+                created = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2, D3D11_SDK_VERSION, &device_, &actual, &context_);
+        }
         Check(created, "D3D11CreateDevice");
         ComPtr<IDXGIDevice> dxgi;
         ComPtr<IDXGIAdapter> adapter;
@@ -1660,6 +1677,19 @@ public:
             r.copiedWidth = width;
         }
         slowMark();
+        // r24 lazy readback: the previous resolve's staged copy (queued a frame ago) into guest memory now if the GPU
+        // has finished it - before this resolve takes the entry over.
+        if (LazyReadbackOn() && r.texViewHot && r.valid && r.staged && r.stagedSeq == r.seq && !r.cpuCoherent &&
+            r.stagedPitch == pitch && r.stagedHeight == height && r.staging)
+        {
+            std::vector<uint32_t> px;
+            if (ReadStaging(r.staging.Get(), r.pitch, r.height, px, true))
+            {
+                r.staged = false;
+                Scatter(dest, r, px, 0);
+                r.lazyAt = std::chrono::steady_clock::now();
+            }
+        }
         // The resolve owns its destination from now on; any older decode of these bytes is
         // stale. Consume earlier CPU writes so only LATER ones invalidate this entry.
         r.size = ResolveBytes(pitch, height);
@@ -1694,7 +1724,7 @@ public:
         const bool thumbnailShot = !depth && pitch == 128 && height == 304;
         if (writeback || (pitch * height <= smallWriteback && smallSync) || thumbnailShot) WriteBack(dest, r);
         else if (pitch * height <= smallWriteback) { if (!(toggle_ & 8)) { StageReadback(r); smallPending_.insert(dest); if (FlashMax()) flashSmallDests_.insert(dest); } }
-        else if (r.readbackHot) { StageReadback(r); slowStaged = true; }
+        else if (r.readbackHot || (r.texViewHot && LazyReadbackOn())) { StageReadback(r); slowStaged = true; }
         slowMark();
         {
             LARGE_INTEGER f;
@@ -1874,7 +1904,13 @@ public:
             // TTT2_SWAP_BUFFERS=3/4 (experiment): MEASURED 2026-10-15 over 5 min of real play,
             // three buffers neither shortened the fight intro's readback waits (median 7.6 ms
             // either way) nor reduced dropped frames, so two stay the default.
+            // r24 (Android): three by default - a phone's compositor holds one image, and with two the
+            // GPU waited for the display every other frame (the r22 log: 221 of 223 flips late).
+#ifdef __ANDROID__
+            static const UINT buffers = [] { const char* e = std::getenv("TTT2_SWAP_BUFFERS"); const int n = e ? std::atoi(e) : 3; return UINT(std::clamp(n, 2, 4)); }();
+#else
             static const UINT buffers = [] { const char* e = std::getenv("TTT2_SWAP_BUFFERS"); const int n = e ? std::atoi(e) : 2; return UINT(std::clamp(n, 2, 4)); }();
+#endif
             d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = buffers;
             d.Scaling = DXGI_SCALING_STRETCH; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
             d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
@@ -3216,7 +3252,15 @@ private:
         ComPtr<ID3D11Texture2D> logical;          // scaled: the logical-size copy the CPU reads
         ComPtr<ID3D11RenderTargetView> logicalRtv;
         ComPtr<ID3D11Texture2D> staging;
+        // r24 lazy readbacks: a resolve another texture view reads back every frame (texViewHot) is staged at each
+        // resolve and brought into guest memory one frame late, without waiting for the GPU (LazyReadbackOn).
+        bool texViewHot = false;
+        uint32_t stagedPitch = 0, stagedHeight = 0;
+        std::chrono::steady_clock::time_point lazyAt{};     // when guest memory last got a (lazy) copy
     };
+    // r24: TTT2_LAZY_READBACK=0 waits for the GPU at every such read, as before. MEASURED in the r22 log (main menu):
+    // 223 blocking writebacks for 223 frames, "readback waits" 9.9 ms a frame of a 16.7 ms budget.
+    static bool LazyReadbackOn() { static const bool on = [] { const char* e = std::getenv("TTT2_LAZY_READBACK"); return !(e && *e == '0'); }(); return on; }
     struct TexKey
     {
         uint32_t base, format, width, height, pitch, tiled, endian, swizzle, slices;   // slices: count | 0x100 if array
@@ -3236,7 +3280,7 @@ private:
                    uint8_t memoKind = 2; uint32_t rangeBase = 0, rangeBytes = 0, mipStart = 0, mipSize = 0; };
     struct Stats { uint64_t draws = 0, triangles = 0, skippedDraws = 0, emptyDraws = 0, resolves = 0, presents = 0,
                    compiles = 0, diskHits = 0, uploads = 0, uploadBytes = 0, resolvedHits = 0, writebacks = 0,
-                   depthResolves = 0, depthHits = 0, gpuVsDraws = 0, vertexDataBytes = 0, warmHits = 0, pendingSkips = 0, stagedReadbacks = 0, ringWaits = 0, resolveCreates = 0, resolvePoolHits = 0, shadowSkips = 0; double ringWaitMs = 0; };
+                   depthResolves = 0, depthHits = 0, gpuVsDraws = 0, vertexDataBytes = 0, warmHits = 0, pendingSkips = 0, stagedReadbacks = 0, lazyReadbacks = 0, ringWaits = 0, resolveCreates = 0, resolvePoolHits = 0, shadowSkips = 0; double ringWaitMs = 0; };
     // ---- SHADOWS OFF (display_settings::GetShadows): the game's cast shadows come from square depth maps - about
     // 50 depth-only draws per frame (colour writes off, depth written, compare GEQUAL; cleared by draws with compare
     // ALWAYS) into an EDRAM depth surface, resolved as a 512 / 1024 / 2048 square depth texture, turned into an
@@ -5997,7 +6041,30 @@ private:
                               t.tiled ? "tiled " : "", t.width, t.height, t.pitch, r.pitch, r.height,
                               t.base == rs ? "" : " offset");
                 ++writebackCauses_[cause];
-                WriteBack(rs, r);
+                // r24 lazy readback: once guest memory holds a recent copy (under half a second old), this frame's
+                // copy is taken only if the GPU has it ready; otherwise the texture reads last frame's pixels
+                // and the copy lands at the next resolve - no wait for the GPU here.
+                const auto now = std::chrono::steady_clock::now();
+                const bool lazy = LazyReadbackOn() && r.texViewHot && r.lazyAt.time_since_epoch().count() &&
+                                  now - r.lazyAt < std::chrono::milliseconds(500);
+                if (lazy)
+                {
+                    std::vector<uint32_t> px;
+                    if (r.staged && r.stagedSeq == r.seq && r.stagedPitch == r.pitch && r.stagedHeight == r.height && r.staging &&
+                        ReadStaging(r.staging.Get(), r.pitch, r.height, px, true))
+                    {
+                        r.staged = false;
+                        Scatter(rs, r, px, 0);
+                        r.lazyAt = now;
+                    }
+                    else ++stats_.lazyReadbacks;
+                }
+                else
+                {
+                    WriteBack(rs, r);
+                    r.texViewHot = true;            // its next resolves are staged (and read lazily)
+                    r.lazyAt = now;
+                }
             }
         }
 
@@ -6395,6 +6462,8 @@ private:
         }
         r.staged = true;
         r.stagedSeq = r.seq;
+        r.stagedPitch = r.pitch;
+        r.stagedHeight = r.height;
         r.stagedAt = std::chrono::steady_clock::now();
         ++stats_.stagedReadbacks;
     }
@@ -7447,6 +7516,8 @@ private:
                        stats_.gpuVsDraws - reported_.gpuVsDraws, stats_.vertexDataBytes - reported_.vertexDataBytes };
         const uint64_t warmHits = stats_.warmHits - reported_.warmHits, pendingSkips = stats_.pendingSkips - reported_.pendingSkips;
         const uint64_t staged = stats_.stagedReadbacks - reported_.stagedReadbacks;
+        if (const uint64_t lazy = stats_.lazyReadbacks - reported_.lazyReadbacks)
+            std::fprintf(stderr, "[gpu-hw]   lazy readbacks: %llu texture reads used last frame's copy (no GPU wait)\n", (unsigned long long)lazy);
         const uint64_t ringWaits = stats_.ringWaits - reported_.ringWaits;
         const double ringWaitMs = stats_.ringWaitMs - reported_.ringWaitMs;
         const uint64_t resolveCreates = stats_.resolveCreates - reported_.resolveCreates;

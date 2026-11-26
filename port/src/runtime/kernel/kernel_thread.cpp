@@ -414,9 +414,9 @@ uint32_t SetupThreadBlock(uint32_t threadId, uint32_t& stackTopOut)
     stackTopOut = g + TOTAL;
     const DWORD tid = GetCurrentThreadId();
     const uint32_t entry = KernelGuestThreadEntry(tid);
-#ifdef __ANDROID__
-    ttt2_affinity::GameThread();       // r22: the game's own threads on the big cores
-#endif
+    // r24: the game's other threads are no longer kept on the big cores (r22 put all ~30 there, with the main thread
+    // and the command processor: four fast cores shared by everything). Only those two are pinned now
+    // (android_main.cpp, frame_overlap.cpp MarkCpThread); the rest go wherever the scheduler finds room.
     if (tracked)
     {
         static std::atomic<int> trackedLines{ 0 };

@@ -93,18 +93,19 @@ set(RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/d3dcompile_vkd3d.cpp"      # D3DCompile over vkd3d-shader
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/android_install.cpp"       # disc + TU3 -> game folder (JNI)
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/path_wrap.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gpu_selftest_android.cpp")  # D3D11/DXVK/vkd3d self-test before the game            # Windows paths through fopen/open/stat (--wrap below)
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gpu_selftest_android.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vk/ttt2vk.cpp")              # r24: the native renderer (D3D11 directly on Vulkan)  # D3D11/DXVK/vkd3d self-test before the game            # Windows paths through fopen/open/stat (--wrap below)
 if(NOT TTT2_D3D_LIBS)
     list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/d3d_unavailable.cpp")
 endif()
 add_library(main SHARED ${RUNTIME_SOURCES})
 target_include_directories(main PRIVATE ${WIN32_INCLUDES} "${PORT}/src" "${VKD3D_SOURCE}/include" "${PPC_DIR}" "${XENON_UTILS}" "${SIMDE_DIR}" "${RUNTIME}" "${RUNTIME}/kernel")
 target_compile_definitions(main PRIVATE
-    TTT2_LOCAL_SAVES=1 TTT2_DRAW_CAPTURE_DIAGNOSTICS=1 TTT2_D3D11_MOVIE_BACKEND=1 TTT2_GPU_HW_BACKEND=1 TTT2_HAVE_STEAM=0
+    TTT2_NATIVE_VK=1 TTT2_LOCAL_SAVES=1 TTT2_DRAW_CAPTURE_DIAGNOSTICS=1 TTT2_D3D11_MOVIE_BACKEND=1 TTT2_GPU_HW_BACKEND=1 TTT2_HAVE_STEAM=0
     SIMDE_ENABLE_NATIVE_ALIASES)
 set_property(SOURCE "${RUNTIME}/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS TTT2_VERSION_STR="0.2.0-android" main=ttt2_main)
 target_compile_options(main PRIVATE -O2 -include msvc_crt.h -Wno-everything -ffp-contract=off -fno-strict-aliasing -fno-autolink)
-target_link_libraries(main PRIVATE tekken_ppc ttt2_ffmpeg ttt2_setup_core ttt2_win32 vkd3d_shader SDL2::SDL2 ${TTT2_D3D_LIBS} aaudio log android dl m)
+target_link_libraries(main PRIVATE tekken_ppc ttt2_ffmpeg ttt2_setup_core ttt2_win32 vkd3d_shader SDL2::SDL2 ${TTT2_D3D_LIBS} vulkan aaudio log android dl m)
 # #pragma comment(lib, "ws2_32.lib") & co. become ELF dependent-library records: ignore them.
 target_link_options(main PRIVATE -Wl,--gc-sections -Wl,--no-undefined -Wl,--no-dependent-libraries -Wl,-z,max-page-size=16384 "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libmain.map")
 set_property(TARGET main APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/libmain.map")
