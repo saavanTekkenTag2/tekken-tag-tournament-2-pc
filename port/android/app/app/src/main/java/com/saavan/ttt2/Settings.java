@@ -102,6 +102,8 @@ final class Settings {
         ALL.add(env(P, "Renderer", "D3D11 (DXVK): the tested one. NATIVE VULKAN (EXPERIMENTAL): the game's graphics straight to Vulkan, "
             + "no DXVK in between - may show problems; if it cannot start, DXVK is used.", "TTT2_RENDERER", "",
             new String[] { "", "native" }, new String[] { "D3D11 (DXVK)", "NATIVE VULKAN (TEST)" }));
+        ALL.add(env(P, "Native: background pipelines", "Native Vulkan only: new effects on screens already showing are prepared in the "
+            + "background (no stutter; the effect may appear a frame late).", "TTT2_NATIVE_ASYNC", "1", ONOFF_V, ONOFF_L));
         ALL.add(env(P, "Lazy readbacks", "Effects that copy the picture back each frame use the previous frame's copy instead of waiting for "
             + "the GPU (smoother menus). OFF if an effect looks a frame late.", "TTT2_LAZY_READBACK", "1", ONOFF_V, ONOFF_L));
         ALL.add(env(P, "Render scale", "Overrides Resolution: the game drawn at this fraction of 720p. AUTO follows Resolution.", "TTT2_RENDER_SCALE", "",

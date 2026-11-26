@@ -487,6 +487,14 @@ extern "C" void Ttt2GpuSelfTest(const char* root)
         }
     }
     Log("[gpu-selftest] %s (%d failed)\n", failed ? "FAILED" : "all passed", failed);
+#ifdef TTT2_NATIVE_VK
+    // r26: what the native renderer reported during the tests (pipeline / shader failures behind a FAIL).
+    if (Ttt2VkRequested())
+    {
+        const std::string msgs = Ttt2VkTakeRecentLog();
+        if (!msgs.empty()) Log("[gpu-selftest] native renderer messages:\n%s", msgs.c_str());
+    }
+#endif
     if (g_out) std::fclose(g_out);
     g_out = nullptr;
 }

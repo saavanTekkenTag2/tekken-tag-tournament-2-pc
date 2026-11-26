@@ -79,7 +79,8 @@ public class LauncherActivity extends Activity {
     private final List<View> streaks = new ArrayList<>();
     private final List<Animator> loops = new ArrayList<>();
     private View home, current;
-    private TextView status, cornerVersion;
+    private TextView status, cornerVersion, cornerArrow;
+    private View playBadge;
     private ProgressBar progress;
     private MenuItem playItem, isoItem, tuItem;
     private final List<MenuItem> menuItems = new ArrayList<>();
@@ -234,6 +235,31 @@ public class LauncherActivity extends Activity {
         }
     }
 
+    /** An original play badge: a red disc, a white triangle and a soft ring (not any brand's logo). */
+    final class PlayBadge extends View {
+        final Paint disc = new Paint(Paint.ANTI_ALIAS_FLAG), tri = new Paint(Paint.ANTI_ALIAS_FLAG), ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        PlayBadge() {
+            super(LauncherActivity.this);
+            disc.setColor(RED);
+            tri.setColor(Color.WHITE);
+            ring.setStyle(Paint.Style.STROKE);
+            ring.setStrokeWidth(dp(1.5f));
+            ring.setColor(Color.argb(150, 255, 120, 120));
+        }
+        @Override protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight(), r = Math.min(w, h) / 2f - dp(2);
+            c.drawCircle(w / 2, h / 2, r + dp(1), ring);
+            c.drawCircle(w / 2, h / 2, r - dp(1), disc);
+            Path p = new Path();
+            float s = r * 0.42f;
+            p.moveTo(w / 2 - s * 0.7f, h / 2 - s);
+            p.lineTo(w / 2 + s, h / 2);
+            p.lineTo(w / 2 - s * 0.7f, h / 2 + s);
+            p.close();
+            c.drawPath(p, tri);
+        }
+    }
+
     // ================================================================ root and home
     private View buildRoot() {
         root = new FrameLayout(this);
@@ -342,17 +368,37 @@ public class LauncherActivity extends Activity {
         fp.bottomMargin = dp(14);
         f.addView(foot, fp);
 
+        // r26: "PORTED BY CATONIX" with a pulsing play badge and an arrow - a tap opens the YouTube channel.
         LinearLayout corner = new LinearLayout(this);
         corner.setOrientation(LinearLayout.VERTICAL);
         corner.setGravity(Gravity.END);
-        TextView by = text("PORT BY", 9.5f, STEEL, semi);
+        corner.setPadding(dp(10), dp(6), dp(6), dp(4));
+        TextView by = text("PORTED BY", 9.5f, STEEL, semi);
         by.setLetterSpacing(0.25f);
         corner.addView(by);
-        TextView name = text(Credits.PORT_BY, 15, SILVER, bold);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView name = text(Credits.PORT_BY, 16, SILVER, bold);
         name.setLetterSpacing(0.08f);
-        corner.addView(name);
-        cornerVersion = text(version(), 9.5f, STEEL, regular);
+        row.addView(name);
+        playBadge = new PlayBadge();
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(dp(26), dp(26));
+        bp.leftMargin = dp(8);
+        row.addView(playBadge, bp);
+        cornerArrow = text("\u203A", 22, Color.WHITE, bold);
+        cornerArrow.setPadding(dp(6), 0, 0, dp(2));
+        row.addView(cornerArrow);
+        corner.addView(row);
+        TextView yt = text("WATCH ON YOUTUBE", 8.5f, RED, semi);
+        yt.setLetterSpacing(0.2f);
+        corner.addView(yt);
+        cornerVersion = text(version(), 9f, STEEL, regular);
         corner.addView(cornerVersion);
+        corner.setFocusable(true);
+        corner.setClickable(true);
+        corner.setOnClickListener(v -> open(Credits.BUTTONS[0][1]));
+        tapFeedback(corner);
         FrameLayout.LayoutParams cp = flp(-2, -2, Gravity.END | Gravity.BOTTOM);
         cp.rightMargin = dp(24);
         cp.bottomMargin = dp(14);
@@ -424,6 +470,24 @@ public class LauncherActivity extends Activity {
         driftY.setRepeatMode(ValueAnimator.REVERSE);
         driftY.start();
         loops.add(driftY);
+        if (playBadge != null) {
+            ObjectAnimator px = ObjectAnimator.ofFloat(playBadge, View.SCALE_X, 1f, 1.14f);
+            ObjectAnimator py = ObjectAnimator.ofFloat(playBadge, View.SCALE_Y, 1f, 1.14f);
+            for (ObjectAnimator a : new ObjectAnimator[] { px, py }) {
+                a.setDuration(700);
+                a.setRepeatCount(ValueAnimator.INFINITE);
+                a.setRepeatMode(ValueAnimator.REVERSE);
+                a.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
+                a.start();
+                loops.add(a);
+            }
+            ObjectAnimator ar = ObjectAnimator.ofFloat(cornerArrow, View.TRANSLATION_X, 0, dp(5));
+            ar.setDuration(600);
+            ar.setRepeatCount(ValueAnimator.INFINITE);
+            ar.setRepeatMode(ValueAnimator.REVERSE);
+            ar.start();
+            loops.add(ar);
+        }
         for (int i = 0; i < streaks.size(); i++) {
             final View s = streaks.get(i);
             final int idx = i;

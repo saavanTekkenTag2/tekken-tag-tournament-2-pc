@@ -23,6 +23,9 @@
 #include <vkd3d_shader.h>
 
 #include <algorithm>
+#include <condition_variable>
+#include <thread>
+#include <sys/resource.h>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -50,6 +53,8 @@
 
 namespace ttt2vk {
 
+static std::mutex& RecentMutex() { static std::mutex m; return m; }
+static std::string& Recent() { static std::string s; return s; }
 static void Log(const char* fmt, ...)
 {
     char line[1024];
@@ -58,6 +63,10 @@ static void Log(const char* fmt, ...)
     std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     std::fprintf(stderr, "[native-vk] %s\n", line);
+    // r26: kept for the GPU self-test's report (it runs before the game's log is open).
+    std::lock_guard l(RecentMutex());
+    std::string& r = Recent();
+    if (r.size() < 16384) { r += line; r += '\n'; }
 }
 
 static bool Same(REFIID a, REFIID b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
@@ -362,6 +371,8 @@ struct Texture : Child<Stub_ID3D11Texture2D<ID3D11Texture2D>>
     bool scoherent = true;
     std::vector<VkDeviceSize> soffset;       // per subresource
     uint64_t lastWrite = 0;
+    uint64_t lastRtFrame = 0;                // r26: frames in a row drawn into (async pipelines only for those)
+    uint32_t rtStreak = 0;
     explicit Texture(Device* d) : Child(d) {}
     ~Texture() override;
     void* Find(REFIID riid) override
@@ -446,6 +457,7 @@ struct Dsv : Child<Stub_ID3D11DepthStencilView<ID3D11DepthStencilView>>
 struct BlendState : Child<Stub_ID3D11BlendState<ID3D11BlendState>>
 {
     D3D11_BLEND_DESC desc{};
+    uint64_t id = 0;
     explicit BlendState(Device* d) : Child(d) {}
     void* Find(REFIID riid) override { return Same(riid, __uuidof(ID3D11BlendState)) || Same(riid, __uuidof(ID3D11DeviceChild)) ? static_cast<ID3D11BlendState*>(this) : nullptr; }
     void STDMETHODCALLTYPE GetDesc(D3D11_BLEND_DESC* d) override { *d = desc; }
@@ -453,6 +465,7 @@ struct BlendState : Child<Stub_ID3D11BlendState<ID3D11BlendState>>
 struct RasterState : Child<Stub_ID3D11RasterizerState<ID3D11RasterizerState>>
 {
     D3D11_RASTERIZER_DESC desc{};
+    uint64_t id = 0;
     explicit RasterState(Device* d) : Child(d) {}
     void* Find(REFIID riid) override { return Same(riid, __uuidof(ID3D11RasterizerState)) || Same(riid, __uuidof(ID3D11DeviceChild)) ? static_cast<ID3D11RasterizerState*>(this) : nullptr; }
     void STDMETHODCALLTYPE GetDesc(D3D11_RASTERIZER_DESC* d) override { *d = desc; }
@@ -460,6 +473,7 @@ struct RasterState : Child<Stub_ID3D11RasterizerState<ID3D11RasterizerState>>
 struct DepthState : Child<Stub_ID3D11DepthStencilState<ID3D11DepthStencilState>>
 {
     D3D11_DEPTH_STENCIL_DESC desc{};
+    uint64_t id = 0;
     explicit DepthState(Device* d) : Child(d) {}
     void* Find(REFIID riid) override { return Same(riid, __uuidof(ID3D11DepthStencilState)) || Same(riid, __uuidof(ID3D11DeviceChild)) ? static_cast<ID3D11DepthStencilState*>(this) : nullptr; }
     void STDMETHODCALLTYPE GetDesc(D3D11_DEPTH_STENCIL_DESC* d) override { *d = desc; }
@@ -476,12 +490,104 @@ struct Sampler : Child<Stub_ID3D11SamplerState<ID3D11SamplerState>>
 
 // ---------------------------------------------------------------- shaders
 struct Binding { uint32_t kind; uint32_t reg; uint32_t binding; VkDescriptorType type; };   // kind: 0 cbv 1 srv 2 sampler
+// r26: a pipeline's description, complete in itself - made on a worker thread (async pipelines) or at once.
+struct PipeDesc
+{
+    Ref<ID3D11VertexShader> vsRef;            // keep the modules alive while a worker builds
+    Ref<ID3D11PixelShader> psRef;
+    VkShaderModule vsMod = VK_NULL_HANDLE, psMod = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkRenderPass pass = VK_NULL_HANDLE;
+    VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkBool32 restart = VK_FALSE;
+    std::vector<VkVertexInputBindingDescription> vbind;
+    std::vector<VkVertexInputAttributeDescription> vattr;
+    VkPipelineRasterizationStateCreateInfo rs{};
+    VkPipelineMultisampleStateCreateInfo ms{};
+    VkSampleMask mask = ~0u;
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    VkPipelineColorBlendAttachmentState cba[8]{};
+    uint32_t colorCount = 0;
+};
+struct PipeKey
+{
+    uint64_t vs = 0, ps = 0, il = 0, blend = 0, raster = 0, depth = 0, pass = 0;
+    uint32_t topo = 0, mask = 0, flags = 0, pad = 0;
+    uint32_t strides[8] = {};
+    bool operator==(const PipeKey& o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
+};
+struct PipeKeyHash
+{
+    size_t operator()(const PipeKey& k) const
+    {
+        const auto* b = reinterpret_cast<const unsigned char*>(&k);
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < sizeof(k); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+        return size_t(h);
+    }
+};
+struct PipeEntry { std::atomic<VkPipeline> pipe{ VK_NULL_HANDLE }; std::atomic<int> state{ 0 }; };   // 0 building 1 ready 2 failed
+static VkPipeline CreatePipeline(VkDevice dev, VkPipelineCache cache, const PipeDesc& d)
+{
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    uint32_t n = 0;
+    stages[n] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+    stages[n].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[n].module = d.vsMod;
+    stages[n].pName = "main";
+    ++n;
+    if (d.psMod)
+    {
+        stages[n] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+        stages[n].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[n].module = d.psMod;
+        stages[n].pName = "main";
+        ++n;
+    }
+    VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    vi.vertexBindingDescriptionCount = uint32_t(d.vbind.size());
+    vi.pVertexBindingDescriptions = d.vbind.data();
+    vi.vertexAttributeDescriptionCount = uint32_t(d.vattr.size());
+    vi.pVertexAttributeDescriptions = d.vattr.data();
+    VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = d.topo;
+    ia.primitiveRestartEnable = d.restart;
+    VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineMultisampleStateCreateInfo ms = d.ms;
+    ms.pSampleMask = &d.mask;
+    VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = d.colorCount;
+    cb.pAttachments = d.cba;
+    const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkPipelineDynamicStateCreateInfo dy{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 4;
+    dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo ci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    ci.stageCount = n;
+    ci.pStages = stages;
+    ci.pVertexInputState = &vi;
+    ci.pInputAssemblyState = &ia;
+    ci.pViewportState = &vp;
+    ci.pRasterizationState = &d.rs;
+    ci.pMultisampleState = &ms;
+    ci.pDepthStencilState = &d.ds;
+    ci.pColorBlendState = &cb;
+    ci.pDynamicState = &dy;
+    ci.layout = d.layout;
+    ci.renderPass = d.pass;
+    VkPipeline pl = VK_NULL_HANDLE;
+    const VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &ci, nullptr, &pl);
+    if (r != VK_SUCCESS) { Log("vkCreateGraphicsPipelines failed (%d)", int(r)); return VK_NULL_HANDLE; }
+    return pl;
+}
 struct ShaderCode
 {
     VkShaderModule module = VK_NULL_HANDLE;
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     std::vector<Binding> bindings;
     std::vector<std::pair<std::string, uint32_t>> inputs;     // vertex: "SEMANTICn" -> register
+    uint32_t dynamicCount = 0;                                // r26: constant buffers bound with dynamic offsets
     uint64_t id = 0;
 };
 struct VertexShader : Child<Stub_ID3D11VertexShader<ID3D11VertexShader>>
@@ -555,6 +661,16 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
     std::mutex oneOffMutex;
     VkCommandPool oneOffPool = VK_NULL_HANDLE;
     std::string gpuName;
+    // r26: pipelines built on worker threads (async) and a pipeline cache kept on disk between runs.
+    struct PipeJob { PipeDesc d; std::shared_ptr<PipeEntry> e; };
+    std::mutex jobMutex;
+    std::condition_variable jobCv;
+    std::deque<PipeJob> jobs;
+    std::atomic<uint64_t> pipelinesMade{ 0 };
+    uint64_t pipelinesSaved = 0;
+    std::string cachePath;
+    void StartWorkers();
+    void SavePipelineCache(bool wait);
 
     ~Device() override;
     void* Find(REFIID riid) override;
@@ -598,6 +714,7 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
         if (!out) return S_FALSE;
         auto* s = new BlendState(this);
         s->desc = *desc;
+        s->id = ids++;
         *out = s;
         return S_OK;
     }
@@ -606,6 +723,7 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
         if (!out) return S_FALSE;
         auto* s = new DepthState(this);
         s->desc = *desc;
+        s->id = ids++;
         *out = s;
         return S_OK;
     }
@@ -614,6 +732,7 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
         if (!out) return S_FALSE;
         auto* s = new RasterState(this);
         s->desc = *desc;
+        s->id = ids++;
         *out = s;
         return S_OK;
     }
@@ -715,8 +834,9 @@ VkBufferView Srv::BufferView()
     bviewOff = off;
     return bview;
 }
-Rtv::~Rtv() { Core* c = &device->core; VkImageView v = view; c->Defer([c, v] { if (v) vkDestroyImageView(c->dev, v, nullptr); }); }
-Dsv::~Dsv() { Core* c = &device->core; VkImageView v = view; c->Defer([c, v] { if (v) vkDestroyImageView(c->dev, v, nullptr); }); }
+static void ForgetTargetView(Device* d, VkImageView v);     // after Context
+Rtv::~Rtv() { ForgetTargetView(device, view); Core* c = &device->core; VkImageView v = view; c->Defer([c, v] { if (v) vkDestroyImageView(c->dev, v, nullptr); }); }
+Dsv::~Dsv() { ForgetTargetView(device, view); Core* c = &device->core; VkImageView v = view; c->Defer([c, v] { if (v) vkDestroyImageView(c->dev, v, nullptr); }); }
 Sampler::~Sampler() { Core* c = &device->core; VkSampler s = sampler; c->Defer([c, s] { if (s) vkDestroySampler(c->dev, s, nullptr); }); }
 static void DestroyShader(Core* c, ShaderCode& s)
 {
@@ -821,6 +941,13 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         Ref<ID3D11ShaderResourceView> srv[MaxSrv];
         Ref<ID3D11SamplerState> sampler[MaxSampler];
         bool dirty = true;
+        // r26: the last descriptor set written for this stage, reused while only constant-buffer offsets change
+        // (they are dynamic offsets): the renderer moves its constant ring at every draw.
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        std::vector<uint64_t> sig;
+        uint32_t offsets[16] = {};
+        uint32_t offsetCount = 0;
     } vsStage, psStage;
     Ref<ID3D11VertexShader> vs;
     Ref<ID3D11PixelShader> ps;
@@ -857,7 +984,6 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
     VkDescriptorSet sets[2]{};
     std::map<std::vector<uint64_t>, VkRenderPass> renderPasses;
     std::map<std::vector<uint64_t>, VkFramebuffer> framebuffers;
-    std::unordered_map<std::string, VkPipeline> pipelines;
     uint64_t commandsRecorded = 0;
     // Dummies for unbound slots.
     VkImage dummyImage = VK_NULL_HANDLE;
@@ -940,6 +1066,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         boundPipeline = VK_NULL_HANDLE;
         boundLayout = VK_NULL_HANDLE;
         vsStage.dirty = psStage.dirty = true;
+        vsStage.set = psStage.set = VK_NULL_HANDLE;
         return cmd;
     }
     // Submits what was recorded (if anything). waitSem/signalSem: the present's.
@@ -974,6 +1101,8 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         pools.clear();
         cmd = VK_NULL_HANDLE;
         commandsRecorded = 0;
+        // Sets came from the pools just handed to that submission: written again from here.
+        vsStage.set = psStage.set = VK_NULL_HANDLE;
     }
 
     void Barrier()
@@ -1020,6 +1149,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
     {
         FlushNewImages();
         EndPass();
+        FlushClears();
         ++commandsRecorded;
         return Cmd();
     }
@@ -1044,7 +1174,8 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
             else
             {
                 const VkDescriptorPoolSize sizes[] = {
-                    { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8192 }, { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192 },
+                    { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8192 },
+                    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192 },
                     { VK_DESCRIPTOR_TYPE_SAMPLER, 4096 }, { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048 },
                     { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 } };
                 VkDescriptorPoolCreateInfo ci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -1087,7 +1218,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
                     const VkDeviceSize first = c.ranged ? VkDeviceSize(c.first) * 16 : 0;
                     VkDeviceSize range = c.ranged ? VkDeviceSize(c.num) * 16 : buf->desc.ByteWidth;
                     if (first + range > buf->desc.ByteWidth) range = buf->desc.ByteWidth > first ? buf->desc.ByteWidth - first : 16;
-                    bi.offset = buf->Base() + first;
+                    bi.offset = b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ? 0 : buf->Base() + first;
                     bi.range = std::min(range, maxUbo);
                 }
                 else { bi.buffer = dummyBuffer; bi.offset = 0; bi.range = 65536 < maxUbo ? 65536 : maxUbo; }
@@ -1120,12 +1251,76 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         return set;
     }
 
+    // Signature of what a stage's set would hold (dynamic offsets left out) and those offsets.
+    void StageState(const ShaderCode& sc, Stage& st, std::vector<uint64_t>& sig, uint32_t* offsets, uint32_t& count)
+    {
+        sig.clear();
+        count = 0;
+        const VkDeviceSize maxUbo = core.props.limits.maxUniformBufferRange;
+        for (const Binding& b : sc.bindings)
+        {
+            if (b.kind == 0)
+            {
+                Buffer* buf = b.reg < MaxCb ? static_cast<Buffer*>(st.cb[b.reg].buffer.get()) : nullptr;
+                const Cb& c = st.cb[b.reg < MaxCb ? b.reg : 0];
+                uint64_t h = 0, range = 0, off = 0;
+                if (buf && buf->Handle())
+                {
+                    h = uint64_t(reinterpret_cast<uintptr_t>(buf->Handle()));
+                    const VkDeviceSize first = c.ranged ? VkDeviceSize(c.first) * 16 : 0;
+                    VkDeviceSize r = c.ranged ? VkDeviceSize(c.num) * 16 : buf->desc.ByteWidth;
+                    if (first + r > buf->desc.ByteWidth) r = buf->desc.ByteWidth > first ? buf->desc.ByteWidth - first : 16;
+                    range = std::min(r, maxUbo);
+                    off = buf->Base() + first;
+                }
+                if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) { if (count < 16) offsets[count++] = uint32_t(off); sig.push_back(h); sig.push_back(range); }
+                else { sig.push_back(h); sig.push_back(range ^ (off << 24)); }
+            }
+            else if (b.kind == 1)
+            {
+                Srv* v = b.reg < MaxSrv ? static_cast<Srv*>(st.srv[b.reg].get()) : nullptr;
+                if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) sig.push_back(v ? uint64_t(reinterpret_cast<uintptr_t>(v->BufferView())) : 1);
+                else sig.push_back(v ? uint64_t(reinterpret_cast<uintptr_t>(v->view)) : 2);
+            }
+            else
+            {
+                Sampler* sm = b.reg < MaxSampler ? static_cast<Sampler*>(st.sampler[b.reg].get()) : nullptr;
+                sig.push_back(sm ? uint64_t(reinterpret_cast<uintptr_t>(sm->sampler)) : 3);
+            }
+        }
+    }
+    // Binds the stage's set (set index `index`), writing a new one only when a texture, sampler or buffer changed.
+    void BindStage(const ShaderCode* sc, Stage& st, uint32_t index, VkPipelineLayout layout, bool layoutChanged)
+    {
+        if (!sc || !sc->layout || sc->bindings.empty()) return;
+        std::vector<uint64_t> sig;
+        uint32_t offsets[16];
+        uint32_t count = 0;
+        StageState(*sc, st, sig, offsets, count);
+        bool rebind = layoutChanged;
+        if (!st.set || st.setLayout != sc->layout || sig != st.sig)
+        {
+            st.set = WriteSet(*sc, st);
+            st.setLayout = sc->layout;
+            st.sig.swap(sig);
+            rebind = true;
+        }
+        if (!rebind && (count != st.offsetCount || std::memcmp(offsets, st.offsets, count * sizeof(uint32_t)) != 0)) rebind = true;
+        if (!rebind || !st.set) return;
+        std::memcpy(st.offsets, offsets, count * sizeof(uint32_t));
+        st.offsetCount = count;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, index, 1, &st.set, count, offsets);
+    }
+
     // ---------------------------------------------------------------- render pass
-    VkRenderPass RenderPass(const std::vector<VkFormat>& colors, VkFormat depthFmt)
+    // loadMask: bit i = colour attachment i starts cleared, bit 8 = depth, bit 9 = stencil (r26: a clear right before
+    // a pass is the pass's load op - on a tiled phone GPU the clear costs nothing then).
+    VkRenderPass RenderPass(const std::vector<VkFormat>& colors, VkFormat depthFmt, uint32_t loadMask = 0)
     {
         std::vector<uint64_t> key;
         for (VkFormat f : colors) key.push_back(uint64_t(f));
         key.push_back(0xD0000000ull | uint64_t(depthFmt));
+        key.push_back(loadMask);
         auto it = renderPasses.find(key);
         if (it != renderPasses.end()) return it->second;
         std::vector<VkAttachmentDescription> att;
@@ -1136,7 +1331,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
             VkAttachmentDescription a{};
             a.format = colors[i];
             a.samples = VK_SAMPLE_COUNT_1_BIT;
-            a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.loadOp = (loadMask & (1u << i)) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
             a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -1150,7 +1345,8 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
             VkAttachmentDescription a{};
             a.format = depthFmt;
             a.samples = VK_SAMPLE_COUNT_1_BIT;
-            a.loadOp = a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.loadOp = (loadMask & 0x100) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.stencilLoadOp = (loadMask & 0x200) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
             a.storeOp = a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
             a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
             dref = { uint32_t(att.size()), VK_IMAGE_LAYOUT_GENERAL };
@@ -1187,9 +1383,13 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         if (inPass && !targetsDirty) return true;
         EndPass();
         targetsDirty = false;
+        // r26: the GPU gets work as the frame goes, not only at its end (a CPU read mid-frame waited ~30 ms for
+        // everything recorded since the last present).
+        if (commandsRecorded >= 256) Submit();
         std::vector<VkFormat> colors;
         std::vector<VkImageView> views;
-        uint32_t w = ~0u, h = ~0u;
+        std::vector<Texture*> textures;
+        uint32_t w = ~0u, h = ~0u, maxW = 0, maxH = 0;
         int last = -1;
         for (int i = 0; i < 8; ++i) if (rtv[i]) last = i;
         for (int i = 0; i <= last; ++i)
@@ -1198,20 +1398,63 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
             if (!r) { colors.push_back(VK_FORMAT_UNDEFINED); continue; }
             colors.push_back(r->format);
             views.push_back(r->view);
-            w = std::min(w, r->tex->W(r->mip));
-            h = std::min(h, r->tex->H(r->mip));
+            textures.push_back(r->tex);
+            w = std::min(w, r->tex->W(r->mip)); maxW = std::max(maxW, r->tex->W(r->mip));
+            h = std::min(h, r->tex->H(r->mip)); maxH = std::max(maxH, r->tex->H(r->mip));
         }
         VkFormat df = VK_FORMAT_UNDEFINED;
-        if (Dsv* d = static_cast<Dsv*>(dsv.get()))
+        Dsv* d = static_cast<Dsv*>(dsv.get());
+        if (d)
         {
             df = d->format;
             views.push_back(d->view);
-            w = std::min(w, d->tex->W(d->mip));
-            h = std::min(h, d->tex->H(d->mip));
+            textures.push_back(d->tex);
+            w = std::min(w, d->tex->W(d->mip)); maxW = std::max(maxW, d->tex->W(d->mip));
+            h = std::min(h, d->tex->H(d->mip)); maxH = std::max(maxH, d->tex->H(d->mip));
         }
         if (views.empty()) return false;
-        pass = RenderPass(colors, df);
-        std::vector<uint64_t> fkey{ uint64_t(reinterpret_cast<uintptr_t>(pass)), w, h };
+        // Targets drawn into in consecutive frames (async pipelines are for those).
+        passHot = true;
+        for (Texture* t : textures)
+        {
+            if (t->lastRtFrame != frameNo) { t->rtStreak = t->lastRtFrame + 1 == frameNo ? t->rtStreak + 1 : 1; t->lastRtFrame = frameNo; }
+            if (t->rtStreak < 5) passHot = false;
+        }
+        // Pending clears of these attachments become the pass's load ops (when every attachment has the same size,
+        // so the render area is the whole of each); every other pending clear is done now.
+        uint32_t loadMask = 0;
+        VkClearValue clears[9]{};
+        const bool sameSize = w == maxW && h == maxH;
+        if (sameSize && !pendingClears.empty())
+        {
+            uint32_t ai = 0;
+            for (int i = 0; i <= last; ++i)
+            {
+                Rtv* r = static_cast<Rtv*>(rtv[i].get());
+                if (!r) continue;
+                auto it = pendingClears.find(r->view);
+                if (it != pendingClears.end()) { loadMask |= 1u << i; clears[ai] = it->second.value; pendingClears.erase(it); }
+                ++ai;
+            }
+            if (d)
+            {
+                auto it = pendingClears.find(d->view);
+                if (it != pendingClears.end())
+                {
+                    const VkImageAspectFlags full = FullAspect(d->format);
+                    if (it->second.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) loadMask |= 0x100;
+                    if (it->second.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) loadMask |= 0x200;
+                    // Only the stencil asked for, on a depth+stencil target: the depth must be kept - done as a clear.
+                    if ((full & VK_IMAGE_ASPECT_STENCIL_BIT) && !(loadMask & 0x100) && (loadMask & 0x200)) loadMask &= ~0x200u;
+                    if (loadMask & 0x300) { clears[ai] = it->second.value; pendingClears.erase(it); }
+                }
+            }
+        }
+        FlushClears();
+        FlushNewImages();
+        basePass = RenderPass(colors, df, 0);
+        pass = loadMask ? RenderPass(colors, df, loadMask) : basePass;
+        std::vector<uint64_t> fkey{ uint64_t(reinterpret_cast<uintptr_t>(basePass)), w, h };
         for (VkImageView v : views) fkey.push_back(uint64_t(reinterpret_cast<uintptr_t>(v)));
         VkFramebuffer fb;
         auto it = framebuffers.find(fkey);
@@ -1219,7 +1462,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         else
         {
             VkFramebufferCreateInfo ci{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
-            ci.renderPass = pass;
+            ci.renderPass = basePass;
             ci.attachmentCount = uint32_t(views.size());
             ci.pAttachments = views.data();
             ci.width = w;
@@ -1234,13 +1477,35 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         bi.renderPass = pass;
         bi.framebuffer = fb;
         bi.renderArea = { { 0, 0 }, { w, h } };
-        FlushNewImages();
+        bi.clearValueCount = loadMask ? uint32_t(views.size()) : 0;
+        bi.pClearValues = loadMask ? clears : nullptr;
         vkCmdBeginRenderPass(Cmd(), &bi, VK_SUBPASS_CONTENTS_INLINE);
         inPass = true;
         passExtent = { w, h };
         boundPipeline = VK_NULL_HANDLE;
         return true;
     }
+
+    // ---- pending clears (r26)
+    struct PendingClear { VkImage image; uint32_t mip, layer; VkImageAspectFlags aspect; VkClearValue value; };
+    std::unordered_map<VkImageView, PendingClear> pendingClears;
+    // Every pending clear as a transfer clear (outside a pass).
+    void FlushClears()
+    {
+        if (pendingClears.empty()) return;
+        EndPass();
+        VkCommandBuffer c = Cmd();
+        for (auto& [v, pc] : pendingClears)
+        {
+            const VkImageSubresourceRange range{ pc.aspect, pc.mip, 1, pc.layer, 1 };
+            if (pc.aspect & VK_IMAGE_ASPECT_COLOR_BIT) vkCmdClearColorImage(c, pc.image, VK_IMAGE_LAYOUT_GENERAL, &pc.value.color, 1, &range);
+            else vkCmdClearDepthStencilImage(c, pc.image, VK_IMAGE_LAYOUT_GENERAL, &pc.value.depthStencil, 1, &range);
+        }
+        pendingClears.clear();
+        Barrier();
+    }
+    // A view went away (its handle may be reused): no clear for it, no framebuffer with it.
+    void ForgetTarget(VkImageView v) { pendingClears.erase(v); ForgetView(v); }
     void DropFramebuffers()
     {
         std::vector<VkFramebuffer> old;
@@ -1265,7 +1530,25 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
     }
 
     // ---------------------------------------------------------------- pipelines
-    VkPipeline Pipeline(VkPipelineLayout layout)
+    // r26: pipelines keyed by the ids of the immutable state objects (no descriptor copies per draw), built on worker
+    // threads for targets drawn into for 5+ frames in a row (a draw waits a frame or two then), at once otherwise
+    // (render-to-texture bakes the CPU reads back must not lose a draw).
+    uint64_t frameNo = 1, skippedDraws = 0, syncPipelines = 0, asyncPipelines = 0;
+    VkRenderPass basePass = VK_NULL_HANDLE;           // the LOAD variant: framebuffers and pipelines use it
+    bool passHot = false;                            // the current targets were drawn into in the last 5 frames
+    std::unordered_map<PipeKey, std::shared_ptr<PipeEntry>, PipeKeyHash> pipelines;
+    static bool AsyncOn() { static const bool on = [] { const char* e = std::getenv("TTT2_NATIVE_ASYNC"); return !(e && *e == '0'); }(); return on; }
+
+    bool ClipForced() const
+    {
+        const char* fe = std::getenv("DXVK_ANDROID_FORCE_DEPTH_CLIP");
+#ifdef __ANDROID__
+        return !(fe && fe[0] == '0') && !std::getenv("TTT2_NATIVE_DEPTH_CLAMP");
+#else
+        return fe && fe[0] == '1';
+#endif
+    }
+    void Describe(PipeDesc& o, VkPipelineLayout layout)
     {
         auto* v = static_cast<VertexShader*>(vs.get());
         auto* p = static_cast<PixelShader*>(ps.get());
@@ -1275,81 +1558,40 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         auto* d = static_cast<DepthState*>(depth.get());
         D3D11_BLEND_DESC bd{};
         if (b) bd = b->desc;
-        else { bd.RenderTarget[0].RenderTargetWriteMask = 0xF; for (auto& t : bd.RenderTarget) t.RenderTargetWriteMask = 0xF; }
+        else for (auto& t : bd.RenderTarget) t.RenderTargetWriteMask = 0xF;
         D3D11_RASTERIZER_DESC rd{};
         if (r) rd = r->desc;
         else { rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_BACK; rd.DepthClipEnable = TRUE; }
         D3D11_DEPTH_STENCIL_DESC dd{};
         if (d) dd = d->desc;
         else { dd.DepthEnable = TRUE; dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; dd.DepthFunc = D3D11_COMPARISON_LESS; dd.StencilReadMask = dd.StencilWriteMask = 0xFF; }
-        // Key: everything the pipeline is made of.
-        std::string key;
-        auto add = [&](const void* data, size_t n) { key.append(static_cast<const char*>(data), n); };
-        const uint64_t ids[4] = { v ? v->code.id : 0, p ? p->code.id : 0, l ? l->id : 0, uint64_t(reinterpret_cast<uintptr_t>(pass)) };
-        add(ids, sizeof(ids));
-        add(&topology, sizeof(topology));
-        add(&bd, sizeof(bd));
-        add(&rd, sizeof(rd));
-        add(&dd, sizeof(dd));
-        add(&sampleMask, sizeof(sampleMask));
-        const char* fce = std::getenv("DXVK_ANDROID_FORCE_DEPTH_CLIP");
-        const char fc = fce ? fce[0] : '-';
-        add(&fc, 1);
-        if (l) for (auto& a : l->attrs) add(&vb[a.slot].stride, sizeof(UINT));
-        auto it = pipelines.find(key);
-        if (it != pipelines.end()) return it->second;
-
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        uint32_t stageCount = 0;
-        stages[stageCount] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-        stages[stageCount].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[stageCount].module = v->code.module;
-        stages[stageCount].pName = "main";
-        ++stageCount;
-        if (p)
+        o.vsRef = vs;
+        o.psRef = ps;
+        o.vsMod = v->code.module;
+        o.psMod = p ? p->code.module : VK_NULL_HANDLE;
+        o.layout = layout;
+        o.pass = basePass;
+        switch (topology)
         {
-            stages[stageCount] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-            stages[stageCount].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-            stages[stageCount].module = p->code.module;
-            stages[stageCount].pName = "main";
-            ++stageCount;
+        case D3D11_PRIMITIVE_TOPOLOGY_POINTLIST: o.topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+        case D3D11_PRIMITIVE_TOPOLOGY_LINELIST: o.topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP: o.topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; o.restart = VK_TRUE; break;
+        case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: o.topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; o.restart = VK_TRUE; break;
+        default: o.topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
         }
-        std::vector<VkVertexInputBindingDescription> vbind;
-        std::vector<VkVertexInputAttributeDescription> vattr;
         if (l)
             for (auto& a : l->attrs)
             {
-                vattr.push_back({ a.location, a.slot, a.format, a.offset });
+                o.vattr.push_back({ a.location, a.slot, a.format, a.offset });
                 bool have = false;
-                for (auto& bnd : vbind) if (bnd.binding == a.slot) have = true;
-                if (!have) vbind.push_back({ a.slot, vb[a.slot].stride, a.instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX });
+                for (auto& bnd : o.vbind) if (bnd.binding == a.slot) have = true;
+                if (!have) o.vbind.push_back({ a.slot, vb[a.slot].stride, a.instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX });
             }
-        VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-        vi.vertexBindingDescriptionCount = uint32_t(vbind.size());
-        vi.pVertexBindingDescriptions = vbind.data();
-        vi.vertexAttributeDescriptionCount = uint32_t(vattr.size());
-        vi.pVertexAttributeDescriptions = vattr.data();
-        VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-        switch (topology)
-        {
-        case D3D11_PRIMITIVE_TOPOLOGY_POINTLIST: ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
-        case D3D11_PRIMITIVE_TOPOLOGY_LINELIST: ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
-        case D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP: ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; ia.primitiveRestartEnable = VK_TRUE; break;
-        case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; ia.primitiveRestartEnable = VK_TRUE; break;
-        default: ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
-        }
-        VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-        vp.viewportCount = vp.scissorCount = 1;
-        VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        // r25: Adreno drops primitives drawn with depth clamp (self-test 7a / 13 on an Adreno 810: nothing drawn, and the
-        // following tests too). Depth clip stays on, as the DXVK path does, unless DXVK_ANDROID_FORCE_DEPTH_CLIP=0.
-        const char* fe = std::getenv("DXVK_ANDROID_FORCE_DEPTH_CLIP");
-#ifdef __ANDROID__
-        const bool forceClip = !(fe && fe[0] == '0');
-#else
-        const bool forceClip = fe && fe[0] == '1';
-#endif
-        const bool clip = rd.DepthClipEnable || (forceClip && !std::getenv("TTT2_NATIVE_DEPTH_CLAMP"));
+        VkPipelineRasterizationStateCreateInfo& rs = o.rs;
+        rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        // Adreno drops primitives drawn with depth clamp (self-test 7a): depth clip stays on, as on the DXVK path,
+        // unless DXVK_ANDROID_FORCE_DEPTH_CLIP=0.
+        const bool clip = rd.DepthClipEnable || ClipForced();
         rs.depthClampEnable = (!clip && core.enabled.depthClamp) ? VK_TRUE : VK_FALSE;
         rs.polygonMode = (rd.FillMode == D3D11_FILL_WIREFRAME && core.enabled.fillModeNonSolid) ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         rs.cullMode = rd.CullMode == D3D11_CULL_FRONT ? VK_CULL_MODE_FRONT_BIT : rd.CullMode == D3D11_CULL_BACK ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
@@ -1360,71 +1602,96 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         rs.depthBiasSlopeFactor = rd.SlopeScaledDepthBias;
         rs.depthBiasClamp = core.enabled.depthBiasClamp ? rd.DepthBiasClamp : 0.0f;
         rs.lineWidth = 1.0f;
-        VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        const VkSampleMask mask = sampleMask;
-        ms.pSampleMask = &mask;
-        ms.alphaToCoverageEnable = bd.AlphaToCoverageEnable ? VK_TRUE : VK_FALSE;
-        VkPipelineDepthStencilStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+        o.ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        o.ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        o.ms.alphaToCoverageEnable = bd.AlphaToCoverageEnable ? VK_TRUE : VK_FALSE;
+        o.mask = sampleMask;
+        VkPipelineDepthStencilStateCreateInfo& ds = o.ds;
+        ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
         const bool hasDepth = dsv.get() != nullptr;
         ds.depthTestEnable = (hasDepth && dd.DepthEnable) ? VK_TRUE : VK_FALSE;
         ds.depthWriteEnable = (hasDepth && dd.DepthEnable && dd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) ? VK_TRUE : VK_FALSE;
         ds.depthCompareOp = Compare(dd.DepthFunc);
         ds.stencilTestEnable = (hasDepth && dd.StencilEnable) ? VK_TRUE : VK_FALSE;
         auto face = [&](const D3D11_DEPTH_STENCILOP_DESC& f) {
-            VkStencilOpState s{};
-            s.failOp = StencilOp(f.StencilFailOp);
-            s.passOp = StencilOp(f.StencilPassOp);
-            s.depthFailOp = StencilOp(f.StencilDepthFailOp);
-            s.compareOp = Compare(f.StencilFunc);
-            s.compareMask = dd.StencilReadMask;
-            s.writeMask = dd.StencilWriteMask;
-            return s;
+            VkStencilOpState st{};
+            st.failOp = StencilOp(f.StencilFailOp);
+            st.passOp = StencilOp(f.StencilPassOp);
+            st.depthFailOp = StencilOp(f.StencilDepthFailOp);
+            st.compareOp = Compare(f.StencilFunc);
+            st.compareMask = dd.StencilReadMask;
+            st.writeMask = dd.StencilWriteMask;
+            return st;
         };
         ds.front = face(dd.FrontFace);
         ds.back = face(dd.BackFace);
-        ds.minDepthBounds = 0.0f;
         ds.maxDepthBounds = 1.0f;
         int colorCount = 0;
         for (int i = 0; i < 8; ++i) if (rtv[i]) colorCount = i + 1;
-        VkPipelineColorBlendAttachmentState cba[8]{};
+        o.colorCount = uint32_t(colorCount);
         for (int i = 0; i < colorCount; ++i)
         {
             const D3D11_RENDER_TARGET_BLEND_DESC& t = bd.RenderTarget[bd.IndependentBlendEnable ? i : 0];
-            cba[i].blendEnable = t.BlendEnable ? VK_TRUE : VK_FALSE;
-            cba[i].srcColorBlendFactor = Blend(t.SrcBlend);
-            cba[i].dstColorBlendFactor = Blend(t.DestBlend);
-            cba[i].colorBlendOp = BlendOp(t.BlendOp);
-            cba[i].srcAlphaBlendFactor = AlphaOnly(Blend(t.SrcBlendAlpha));
-            cba[i].dstAlphaBlendFactor = AlphaOnly(Blend(t.DestBlendAlpha));
-            cba[i].alphaBlendOp = BlendOp(t.BlendOpAlpha);
-            cba[i].colorWriteMask = t.RenderTargetWriteMask & 0xF;
+            VkPipelineColorBlendAttachmentState& c = o.cba[i];
+            c.blendEnable = t.BlendEnable ? VK_TRUE : VK_FALSE;
+            c.srcColorBlendFactor = Blend(t.SrcBlend);
+            c.dstColorBlendFactor = Blend(t.DestBlend);
+            c.colorBlendOp = BlendOp(t.BlendOp);
+            c.srcAlphaBlendFactor = AlphaOnly(Blend(t.SrcBlendAlpha));
+            c.dstAlphaBlendFactor = AlphaOnly(Blend(t.DestBlendAlpha));
+            c.alphaBlendOp = BlendOp(t.BlendOpAlpha);
+            c.colorWriteMask = t.RenderTargetWriteMask & 0xF;
         }
-        VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-        cb.attachmentCount = uint32_t(colorCount);
-        cb.pAttachments = cba;
-        const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
-        VkPipelineDynamicStateCreateInfo dy{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-        dy.dynamicStateCount = 4;
-        dy.pDynamicStates = dyn;
-        VkGraphicsPipelineCreateInfo ci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        ci.stageCount = stageCount;
-        ci.pStages = stages;
-        ci.pVertexInputState = &vi;
-        ci.pInputAssemblyState = &ia;
-        ci.pViewportState = &vp;
-        ci.pRasterizationState = &rs;
-        ci.pMultisampleState = &ms;
-        ci.pDepthStencilState = &ds;
-        ci.pColorBlendState = &cb;
-        ci.pDynamicState = &dy;
-        ci.layout = layout;
-        ci.renderPass = pass;
-        ci.subpass = 0;
-        VkPipeline pl = VK_NULL_HANDLE;
-        const VkResult res = vkCreateGraphicsPipelines(core.dev, core.pipelineCache, 1, &ci, nullptr, &pl);
-        if (res != VK_SUCCESS) { Log("vkCreateGraphicsPipelines failed (%d)", int(res)); pl = VK_NULL_HANDLE; }
-        pipelines[key] = pl;
+    }
+    VkPipeline Pipeline(VkPipelineLayout layout)
+    {
+        auto* v = static_cast<VertexShader*>(vs.get());
+        auto* p = static_cast<PixelShader*>(ps.get());
+        auto* l = static_cast<InputLayout*>(il.get());
+        PipeKey k;
+        k.vs = v->code.id;
+        k.ps = p ? p->code.id : 0;
+        k.il = l ? l->id : 0;
+        k.blend = blend ? static_cast<BlendState*>(blend.get())->id : 0;
+        k.raster = raster ? static_cast<RasterState*>(raster.get())->id : 0;
+        k.depth = depth ? static_cast<DepthState*>(depth.get())->id : 0;
+        k.pass = uint64_t(reinterpret_cast<uintptr_t>(basePass));
+        k.topo = uint32_t(topology);
+        k.mask = sampleMask;
+        k.flags = (dsv ? 1u : 0u) | (ClipForced() ? 2u : 0u);
+        if (l) for (auto& a : l->attrs) k.strides[a.slot & 7] = vb[a.slot].stride;
+        auto it = pipelines.find(k);
+        if (it != pipelines.end())
+        {
+            PipeEntry& e = *it->second;
+            const int st = e.state.load();
+            if (st == 1) return e.pipe.load();
+            if (st == 2) return VK_NULL_HANDLE;
+            if (passHot) { ++skippedDraws; return VK_NULL_HANDLE; }
+            // Still building and this target is new: wait for it (a bake must not lose a draw).
+            while (e.state.load() == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            return e.pipe.load();
+        }
+        auto e = std::make_shared<PipeEntry>();
+        pipelines.emplace(k, e);
+        PipeDesc d;
+        Describe(d, layout);
+        if (passHot && AsyncOn())
+        {
+            ++asyncPipelines;
+            {
+                std::lock_guard g(device->jobMutex);
+                device->jobs.push_back({ std::move(d), e });
+            }
+            device->jobCv.notify_one();
+            ++skippedDraws;
+            return VK_NULL_HANDLE;
+        }
+        ++syncPipelines;
+        const VkPipeline pl = CreatePipeline(core.dev, core.pipelineCache, d);
+        e->pipe = pl;
+        e->state = pl ? 1 : 2;
+        ++device->pipelinesMade;
         return pl;
     }
 
@@ -1441,9 +1708,10 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         if (!pl) return false;
         VkCommandBuffer c = cmd;
         if (pl != boundPipeline) { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl); boundPipeline = pl; }
-        if (layout != boundLayout) { boundLayout = layout; vsStage.dirty = psStage.dirty = true; }
-        if (vsStage.dirty) { sets[0] = WriteSet(v->code, vsStage); vsStage.dirty = false; if (sets[0]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &sets[0], 0, nullptr); }
-        if (psStage.dirty) { sets[1] = p ? WriteSet(p->code, psStage) : VK_NULL_HANDLE; psStage.dirty = false; if (sets[1]) vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &sets[1], 0, nullptr); }
+        const bool layoutChanged = layout != boundLayout;
+        boundLayout = layout;
+        BindStage(&v->code, vsStage, 0, layout, layoutChanged);
+        BindStage(p ? &p->code : nullptr, psStage, 1, layout, layoutChanged);
         // Viewport (flipped: D3D's y grows down the screen, Vulkan's clip y the other way) and scissor.
         VkViewport vpt{};
         if (viewportCount)
@@ -1659,32 +1927,65 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
     }
 
     // ---------------------------------------------------------------- clears, copies, uploads
+    // r26: clears are recorded and done as the next render pass's load op (free on a tiled GPU) - or with
+    // vkCmdClearAttachments when the view is an attachment of the pass already open - instead of a transfer each.
     void STDMETHODCALLTYPE ClearRenderTargetView(ID3D11RenderTargetView* v, const FLOAT color[4]) override
     {
         Rtv* r = static_cast<Rtv*>(v);
         if (!r || !r->tex) return;
-        VkCommandBuffer c = Transfer();
-        VkClearColorValue cv{};
-        std::memcpy(cv.float32, color, sizeof(cv.float32));
+        VkClearValue cv{};
+        std::memcpy(cv.color.float32, color, sizeof(cv.color.float32));
         if (r->format == VK_FORMAT_R32G32B32A32_UINT || r->format == VK_FORMAT_R32_UINT || r->format == VK_FORMAT_R8G8B8A8_UINT)
-            for (int i = 0; i < 4; ++i) cv.uint32[i] = uint32_t(color[i]);
-        const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, r->mip, 1, r->layer, 1 };
-        vkCmdClearColorImage(c, r->tex->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &range);
-        AfterTransfer();
+            for (int i = 0; i < 4; ++i) cv.color.uint32[i] = uint32_t(color[i]);
+        if (inPass && !targetsDirty && r->tex->W(r->mip) == passExtent.width && r->tex->H(r->mip) == passExtent.height)
+        {
+            uint32_t idx = 0;
+            for (int i = 0; i < 8; ++i)
+            {
+                if (rtv[i].get() == v)
+                {
+                    VkClearAttachment ca{ VK_IMAGE_ASPECT_COLOR_BIT, idx, cv };
+                    VkClearRect rect{ { { 0, 0 }, passExtent }, 0, 1 };
+                    vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
+                    ++commandsRecorded;
+                    return;
+                }
+                if (rtv[i]) ++idx;
+            }
+        }
+        pendingClears[r->view] = { r->tex->image, r->mip, r->layer, VK_IMAGE_ASPECT_COLOR_BIT, cv };
+        if (inPass) targetsDirty = true;          // a draw in this pass may sample it: the pass restarts after the clear
     }
     void STDMETHODCALLTYPE ClearDepthStencilView(ID3D11DepthStencilView* v, UINT flags, FLOAT depthValue, UINT8 stencil) override
     {
         Dsv* d = static_cast<Dsv*>(v);
         if (!d || !d->tex) return;
-        VkCommandBuffer c = Transfer();
-        VkClearDepthStencilValue cv{ depthValue, stencil };
         VkImageAspectFlags aspect = 0;
         if (flags & D3D11_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
         if ((flags & D3D11_CLEAR_STENCIL) && (FullAspect(d->format) & VK_IMAGE_ASPECT_STENCIL_BIT)) aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
         if (!aspect) return;
-        const VkImageSubresourceRange range{ aspect, d->mip, 1, d->layer, 1 };
-        vkCmdClearDepthStencilImage(c, d->tex->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &range);
-        AfterTransfer();
+        VkClearValue cv{};
+        cv.depthStencil = { depthValue, stencil };
+        if (inPass && !targetsDirty && dsv.get() == v && d->tex->W(d->mip) == passExtent.width && d->tex->H(d->mip) == passExtent.height)
+        {
+            uint32_t idx = 0;
+            for (int i = 0; i < 8; ++i) if (rtv[i]) ++idx;
+            VkClearAttachment ca{ aspect, idx, cv };
+            VkClearRect rect{ { { 0, 0 }, passExtent }, 0, 1 };
+            vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
+            ++commandsRecorded;
+            return;
+        }
+        auto it = pendingClears.find(d->view);
+        if (it != pendingClears.end() && it->second.aspect != aspect)
+        {
+            // A depth clear then a stencil clear (or the reverse): merged.
+            if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) it->second.value.depthStencil.depth = depthValue;
+            if (aspect & VK_IMAGE_ASPECT_STENCIL_BIT) it->second.value.depthStencil.stencil = stencil;
+            it->second.aspect |= aspect;
+        }
+        else pendingClears[d->view] = { d->tex->image, d->mip, d->layer, aspect, cv };
+        if (inPass) targetsDirty = true;
     }
     static bool IsBuffer(ID3D11Resource* r) { D3D11_RESOURCE_DIMENSION t; r->GetType(&t); return t == D3D11_RESOURCE_DIMENSION_BUFFER; }
     void STDMETHODCALLTYPE CopySubresourceRegion(ID3D11Resource* dst, UINT dstSub, UINT dx, UINT dy, UINT dz, ID3D11Resource* src, UINT srcSub, const D3D11_BOX* box) override
@@ -1916,6 +2217,8 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
     void STDMETHODCALLTYPE Flush() override { Submit(); }
 };
 
+static void ForgetTargetView(Device* d, VkImageView v) { if (d->context && v) d->context->ForgetTarget(v); }
+
 // ================================================================ device: init and creation
 bool Device::Init()
 {
@@ -2017,8 +2320,33 @@ bool Device::Init()
     r = vkCreateDevice(core.phys, &dci, nullptr, &core.dev);
     if (r != VK_SUCCESS) { Log("vkCreateDevice failed (%d)", int(r)); return false; }
     vkGetDeviceQueue(core.dev, core.family, 0, &core.queue);
+    // r26: the pipeline cache from the last run (TTT2Recomp/native_pipelines.bin): pipelines built before are
+    // not built again (the first second of a match spent 347 ms in vkCreateGraphicsPipelines, r25 log).
+    std::vector<char> cacheData;
+    if (const char* la = std::getenv("LOCALAPPDATA"))
+    {
+        cachePath = std::string(la) + "/TTT2Recomp/native_pipelines.bin";
+        if (FILE* f = std::fopen(cachePath.c_str(), "rb"))
+        {
+            std::fseek(f, 0, SEEK_END);
+            const long n = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (n > 0 && n < (256l << 20)) { cacheData.resize(size_t(n)); if (std::fread(cacheData.data(), 1, size_t(n), f) != size_t(n)) cacheData.clear(); }
+            std::fclose(f);
+        }
+    }
     VkPipelineCacheCreateInfo pci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
-    vkCreatePipelineCache(core.dev, &pci, nullptr, &core.pipelineCache);
+    pci.initialDataSize = cacheData.size();
+    pci.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+    if (vkCreatePipelineCache(core.dev, &pci, nullptr, &core.pipelineCache) != VK_SUCCESS)
+    {
+        pci.initialDataSize = 0;
+        pci.pInitialData = nullptr;
+        vkCreatePipelineCache(core.dev, &pci, nullptr, &core.pipelineCache);
+        cacheData.clear();
+    }
+    Log("pipeline cache: %zu KB from the last run", cacheData.size() / 1024);
+    StartWorkers();
     VkDescriptorSetLayoutCreateInfo empty{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     vkCreateDescriptorSetLayout(core.dev, &empty, nullptr, &emptySetLayout);
     VkCommandPoolCreateInfo cp{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -2033,6 +2361,7 @@ bool Device::Init()
 
 Device::~Device()
 {
+    SavePipelineCache(true);
     if (context) { context->Submit(); context->WaitFor(core.next.load() - 1); }
     if (core.dev) vkDeviceWaitIdle(core.dev);
     core.completed = ~0ull >> 1;
@@ -2044,6 +2373,53 @@ void* Device::Find(REFIID riid)
 {
     if (Same(riid, __uuidof(ID3D11Device)) || Same(riid, __uuidof(ID3D11Device1))) return static_cast<ID3D11Device1*>(this);
     return nullptr;     // IDXGIDevice: Device::QueryInterface below
+}
+
+void Device::StartWorkers()
+{
+    const char* e = std::getenv("TTT2_NATIVE_PIPELINE_THREADS");
+    const int n = e && std::atoi(e) > 0 ? std::min(std::atoi(e), 4) : 2;
+    for (int i = 0; i < n; ++i)
+        std::thread([this] {
+            setpriority(PRIO_PROCESS, 0, 5);
+            for (;;)
+            {
+                PipeJob job;
+                {
+                    std::unique_lock l(jobMutex);
+                    jobCv.wait(l, [this] { return !jobs.empty(); });
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                }
+                const VkPipeline p = CreatePipeline(core.dev, core.pipelineCache, job.d);
+                job.e->pipe = p;
+                job.e->state = p ? 1 : 2;
+                ++pipelinesMade;
+            }
+        }).detach();
+}
+
+void Device::SavePipelineCache(bool wait)
+{
+    if (cachePath.empty() || !core.pipelineCache) return;
+    const uint64_t made = pipelinesMade.load();
+    if (made == pipelinesSaved) return;
+    pipelinesSaved = made;
+    auto save = [this] {
+        size_t n = 0;
+        if (vkGetPipelineCacheData(core.dev, core.pipelineCache, &n, nullptr) != VK_SUCCESS || !n) return;
+        std::vector<char> data(n);
+        if (vkGetPipelineCacheData(core.dev, core.pipelineCache, &n, data.data()) != VK_SUCCESS) return;
+        const std::string tmp = cachePath + ".tmp";
+        if (FILE* f = std::fopen(tmp.c_str(), "wb"))
+        {
+            const bool ok = std::fwrite(data.data(), 1, n, f) == n;
+            std::fclose(f);
+            if (ok) std::rename(tmp.c_str(), cachePath.c_str());
+        }
+    };
+    if (wait) save();
+    else std::thread(save).detach();
 }
 
 void Device::OneOff(const std::function<void(VkCommandBuffer)>& record)
@@ -2456,7 +2832,13 @@ bool Device::CompileShader(const void* code, SIZE_T size, bool vertex, ShaderCod
         switch (d.type)
         {
         case VKD3D_SHADER_DESCRIPTOR_TYPE_CBV:
-            b.kind = 0; b.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; rb.flags = VKD3D_SHADER_BINDING_FLAG_BUFFER; break;
+            b.kind = 0; rb.flags = VKD3D_SHADER_BINDING_FLAG_BUFFER;
+            // r26: dynamic offsets (the set is reused while only the constant ring's offset moves), within the
+            // device's limit shared by the two stages.
+            if (out.dynamicCount < std::min<uint32_t>(8, core.props.limits.maxDescriptorSetUniformBuffersDynamic / 2))
+            { b.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; ++out.dynamicCount; }
+            else b.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            break;
         case VKD3D_SHADER_DESCRIPTOR_TYPE_SRV:
             b.kind = 1;
             if (d.resource_type == VKD3D_SHADER_RESOURCE_BUFFER) { b.type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; rb.flags = VKD3D_SHADER_BINDING_FLAG_BUFFER; }
@@ -2953,6 +3335,15 @@ struct SwapChain : Com<Stub_IDXGISwapChain1<IDXGISwapChain1>>
     void Pace()
     {
         Context* ctx = device->context;
+        ++ctx->frameNo;
+        if (ctx->frameNo % 300 == 0)
+        {
+            if (ctx->skippedDraws || ctx->asyncPipelines || ctx->syncPipelines)
+                Log("last 300 frames: %llu pipelines built at once, %llu in the background, %llu draws waited for one",
+                    (unsigned long long)ctx->syncPipelines, (unsigned long long)ctx->asyncPipelines, (unsigned long long)ctx->skippedDraws);
+            ctx->skippedDraws = ctx->asyncPipelines = ctx->syncPipelines = 0;
+            device->SavePipelineCache(false);
+        }
         frames.push_back(device->core.next.load() - 1);
         while (frames.size() > DxgiDevice::latency) { ctx->WaitFor(frames.front()); frames.pop_front(); }
     }
@@ -3034,6 +3425,14 @@ struct DeviceImpl : Device
     }
 };
 } // namespace ttt2vk
+
+std::string Ttt2VkTakeRecentLog()
+{
+    std::lock_guard l(ttt2vk::RecentMutex());
+    std::string r;
+    r.swap(ttt2vk::Recent());
+    return r;
+}
 
 bool Ttt2VkRequested()
 {

@@ -11,3 +11,7 @@ HRESULT Ttt2VkCreateDevice(ID3D11Device** device, ID3D11DeviceContext** context)
 
 // True when the native renderer is requested (TTT2_RENDERER=native).
 bool Ttt2VkRequested();
+
+#include <string>
+// r26: the native renderer's messages since the last call (the GPU self-test prints them: it runs before the log opens).
+std::string Ttt2VkTakeRecentLog();
