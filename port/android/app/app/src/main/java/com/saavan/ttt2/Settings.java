@@ -10,6 +10,9 @@ import java.io.InputStreamReader;
 import java.io.BufferedReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -60,7 +63,7 @@ final class Settings {
         // ---------------- DISPLAY (settings.ini [Display], the in-game Options -> Display Settings)
         String D = "DISPLAY";
         ALL.add(ini(D, "Resolution", "The size the game is drawn at. Lower = faster. 540p is a good start for mid-range phones.",
-            "Display", "Resolution", "1280x720",
+            "Display", "Resolution", "960x540",
             new String[] { "640x360", "960x540", "1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160" },
             new String[] { "360p (fastest)", "540p", "720p", "900p", "1080p", "1440p", "4K (slowest)" }));
         ALL.add(ini(D, "Anti-aliasing", "Smooths jagged edges. SSAA draws the game 1.5x / 2x larger: very slow on phones.",
@@ -77,7 +80,7 @@ final class Settings {
             "Display", "LowLatencyMode", "2", new String[] { "0", "1", "2" }, new String[] { "AUTO", "ON", "OFF" }));
         ALL.add(ini(D, "FPS counter", "Frames per second in a corner of the screen.",
             "Display", "FpsCounter", "0", range(0, 4), new String[] { "OFF", "TOP LEFT", "TOP RIGHT", "BOTTOM LEFT", "BOTTOM RIGHT" }));
-        ALL.add(ini(D, "Shadows", "Character and stage shadows. OFF is faster.", "Display", "Shadows", "1", ONOFF_V, ONOFF_L));
+        ALL.add(ini(D, "Shadows", "Character and stage shadows. OFF is faster.", "Display", "Shadows", "0", ONOFF_V, ONOFF_L));
         ALL.add(ini(D, "Depth of field", "Background blur in cut-scenes and menus. OFF is faster.", "Display", "DepthOfField", "1", ONOFF_V, ONOFF_L));
         ALL.add(ini(D, "Bloom", "Glow around bright light. OFF is faster.", "Display", "Bloom", "1", ONOFF_V, ONOFF_L));
         ALL.add(ini(D, "Light shafts", "Rays of light on some stages. OFF is faster.", "Display", "LightShafts", "1", ONOFF_V, ONOFF_L));
@@ -100,7 +103,7 @@ final class Settings {
         // ---------------- PERFORMANCE
         String P = "PERFORMANCE";
         ALL.add(env(P, "Renderer", "D3D11 (DXVK): the tested one. NATIVE VULKAN (EXPERIMENTAL): the game's graphics straight to Vulkan, "
-            + "no DXVK in between - may show problems; if it cannot start, DXVK is used.", "TTT2_RENDERER", "",
+            + "no DXVK in between - may show problems; if it cannot start, DXVK is used.", "TTT2_RENDERER", "native",
             new String[] { "", "native" }, new String[] { "D3D11 (DXVK)", "NATIVE VULKAN (TEST)" }));
         ALL.add(env(P, "Native: background pipelines", "Native Vulkan only: new effects on screens already showing are prepared in the "
             + "background (no stutter; the effect may appear a frame late).", "TTT2_NATIVE_ASYNC", "1", ONOFF_V, ONOFF_L));
@@ -137,7 +140,7 @@ final class Settings {
             "sustained", "1", ONOFF_V, ONOFF_L));
         ALL.add(pref(P, "Display refresh", "Asks the screen for 60 Hz while playing (steadier pacing on 90/120 Hz screens).",
             "fps60", "1", ONOFF_V, ONOFF_L));
-        ALL.add(env(P, "GPU self-test at start", "A few small render checks at start (log only). OFF starts a little faster.", "TTT2_GPU_SELFTEST", "1", ONOFF_V, ONOFF_L));
+        ALL.add(env(P, "GPU self-test at start", "A few small render checks at start (log only). OFF starts a little faster.", "TTT2_GPU_SELFTEST", "0", ONOFF_V, ONOFF_L));
 
         // ---------------- CONTROLS
         String C = "CONTROLS";
@@ -169,6 +172,67 @@ final class Settings {
     }
 
     static final String[] GROUPS = { "DISPLAY", "GAME", "ONLINE", "PERFORMANCE", "CONTROLS", "LAUNCHER", "DEBUG" };
+
+    // ---------------------------------------------------------------- r28: locked settings
+    /**
+     * The settings players can change. Everything else is locked to the tested value (whatever an older build saved),
+     * so a setting cannot make the game slow or unstable. The developer unlock (credits: tap the version 7 times)
+     * shows every setting again for testing.
+     */
+    static final Set<String> BASIC = new HashSet<>(Arrays.asList(
+            "Resolution", "VSync", "Brightness", "FpsCounter", "Sharpness", "Shadows", "DepthOfField", "Bloom", "LightShafts", "Weather",
+            "QuickStart", "InputDelay",
+            "Netcode", "CustomDelay", "CustomRollback", "RematchMenu",
+            "touch", "full_screen", "touch_alpha", "touch_size",
+            "no_anim"));
+    /** Resolution choices when locked: 360p, 540p, 720p (900p and up are too slow on phones). */
+    private static final int BASIC_RESOLUTIONS = 3;
+    static final Set<String> HIDDEN_GROUPS = new HashSet<>(Arrays.asList("PERFORMANCE", "DEBUG"));
+
+    static boolean devUnlocked(Context c) { return c.getSharedPreferences("ttt2", Context.MODE_PRIVATE).getBoolean("dev_unlock", false); }
+    static void setDevUnlocked(Context c, boolean on) { c.getSharedPreferences("ttt2", Context.MODE_PRIVATE).edit().putBoolean("dev_unlock", on).apply(); }
+    static boolean locked(Context c, Opt o) { return !BASIC.contains(o.key) && !devUnlocked(c); }
+    static boolean groupVisible(Context c, String g) { return devUnlocked(c) || !HIDDEN_GROUPS.contains(g); }
+    /** How many of an option's values can be picked. */
+    static int choices(Context c, Opt o) {
+        if (o.key.equals("Resolution") && o.store == INI && !devUnlocked(c)) return Math.min(BASIC_RESOLUTIONS, o.values.length);
+        return o.values.length;
+    }
+
+    /**
+     * Puts every locked setting back to its tested value (launcher start and PLAY), and applies the release defaults once
+     * (540p, shadows off) for players who never chose them.
+     */
+    static void enforce(Context c) {
+        if (devUnlocked(c)) return;
+        LinkedHashMap<String, LinkedHashMap<String, String>> ini = readIni(c);
+        SharedPreferences p = c.getSharedPreferences("ttt2", Context.MODE_PRIVATE);
+        SharedPreferences.Editor e = p.edit();
+        boolean iniChanged = false;
+        for (Opt o : ALL) {
+            if (o.key.equals("Resolution") && o.store == INI) {
+                String v = iniGet(ini, o.section, o.key);
+                int i = -1;
+                for (int k = 0; k < o.values.length; k++) if (o.values[k].equals(v)) i = k;
+                if (v == null || i < 0 || i >= choices(c, o)) { iniPut(ini, o.section, o.key, o.def); iniChanged = true; }
+                continue;
+            }
+            if (!locked(c, o)) {
+                if (o.store == INI && !p.getBoolean("release_defaults_1", false) && iniGet(ini, o.section, o.key) == null) {
+                    iniPut(ini, o.section, o.key, o.def);
+                    iniChanged = true;
+                }
+                continue;
+            }
+            if (o.store == INI) {
+                if (!o.def.equals(iniGet(ini, o.section, o.key))) { iniPut(ini, o.section, o.key, o.def); iniChanged = true; }
+            } else if (o.store == ENV) e.remove("env_" + o.key);
+            else e.remove(o.key);
+        }
+        e.putBoolean("release_defaults_1", true);
+        e.apply();
+        if (iniChanged) writeIni(c, ini);
+    }
 
     // ---------------------------------------------------------------- storage
     static File iniFile(Context c) { return new File(LauncherActivity.dataRoot(c), "TTT2Recomp/settings.ini"); }
@@ -234,6 +298,7 @@ final class Settings {
 
     /** The current value of an option (its default if never set). */
     static String get(Context c, Opt o, LinkedHashMap<String, LinkedHashMap<String, String>> ini) {
+        if (locked(c, o)) return o.def;
         SharedPreferences p = c.getSharedPreferences("ttt2", Context.MODE_PRIVATE);
         switch (o.store) {
             case INI: { String v = iniGet(ini, o.section, o.key); return v != null ? v : o.def; }
@@ -267,10 +332,11 @@ final class Settings {
         List<String> a = new ArrayList<>();
         for (Opt o : ALL) {
             if (o.store != ENV) continue;
-            String v = p.getString("env_" + o.key, o.def);
+            String v = locked(c, o) ? o.def : p.getString("env_" + o.key, o.def);
             if (v == null || v.isEmpty()) continue;
             a.add("--set"); a.add(o.key + "=" + v);
         }
+        if (!devUnlocked(c)) return a;      // custom variables only with the developer unlock
         for (String line : p.getString("env_custom", "").split("\n")) {
             String t = line.trim();
             int eq = t.indexOf('=');

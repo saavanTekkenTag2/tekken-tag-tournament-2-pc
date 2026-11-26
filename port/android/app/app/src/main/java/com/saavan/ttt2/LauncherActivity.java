@@ -108,9 +108,19 @@ public class LauncherActivity extends Activity {
         useFullScreen(this);
         try { bold = getResources().getFont(R.font.oswald_bold); semi = getResources().getFont(R.font.oswald_semibold); regular = getResources().getFont(R.font.oswald_regular); }
         catch (Exception e) { bold = Typeface.DEFAULT_BOLD; semi = Typeface.DEFAULT_BOLD; regular = Typeface.DEFAULT; }
+        Settings.enforce(this);                 // r28: locked settings back to their tested values
         setContentView(buildRoot());
         hideSystemBars();
         refresh();
+        // r28: updates from volvisionmods.com - a popup now if there is a newer version, a notification later.
+        if (savedInstanceState == null) VolvisionUpdateChannel.checkForUpdates(this, VolvisionUpdateChannel.versionName(this));
+        UpdateJob.createChannel(this);
+        UpdateJob.schedule(this);
+        if (android.os.Build.VERSION.SDK_INT >= 33 && !prefs.getBoolean("asked_notifications", false)
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            prefs.edit().putBoolean("asked_notifications", true).apply();
+            requestPermissions(new String[] { "android.permission.POST_NOTIFICATIONS" }, 77);
+        }
     }
 
     /** r23: draw under the camera cut-out too (it left a black band down one side in landscape). Option: "full_screen". */
@@ -343,12 +353,15 @@ public class LauncherActivity extends Activity {
         isoItem = new MenuItem("SELECT ISO", () -> pick(PICK_ISO));
         tuItem = new MenuItem("SELECT TITLE UPDATE", () -> pick(PICK_TU));
         MenuItem options = new MenuItem("OPTIONS", () -> showPage(buildOptions()));
+        MenuItem updates = new MenuItem("CHECK FOR UPDATES", () -> VolvisionUpdateChannel.checkNow(this, VolvisionUpdateChannel.versionName(this)));
         MenuItem credits = new MenuItem("CREDITS", () -> showPage(buildCredits()));
         menuItems.clear();
-        menuItems.add(playItem); menuItems.add(isoItem); menuItems.add(tuItem); menuItems.add(options); menuItems.add(credits);
+        menuItems.add(playItem); menuItems.add(isoItem); menuItems.add(tuItem); menuItems.add(options); menuItems.add(updates); menuItems.add(credits);
         playItem.title.setTextSize(23);
+        // Six entries: a little shorter on short screens so the last one never runs under the footer.
+        final boolean shortScreen = getResources().getDisplayMetrics().heightPixels / getResources().getDisplayMetrics().density < 380;
         for (int i = 0; i < menuItems.size(); i++)
-            menu.addView(menuItems.get(i), llp(dp(300), dp(i == 0 ? 46 : 40), i == 0 ? 0 : 7));
+            menu.addView(menuItems.get(i), llp(dp(300), dp(i == 0 ? (shortScreen ? 40 : 44) : (shortScreen ? 32 : 37)), i == 0 ? 0 : (shortScreen ? 4 : 6)));
         FrameLayout.LayoutParams mp = flp(-2, -2, Gravity.START | Gravity.BOTTOM);
         mp.leftMargin = dp(26);
         mp.bottomMargin = dp(40);
@@ -647,7 +660,9 @@ public class LauncherActivity extends Activity {
         String[] groups = new String[Settings.GROUPS.length + 1];
         System.arraycopy(Settings.GROUPS, 0, groups, 0, Settings.GROUPS.length);
         groups[groups.length - 1] = "TOOLS";
+        if (!Settings.groupVisible(this, optionsGroup)) optionsGroup = "DISPLAY";
         for (String g : groups) {
+            if (!Settings.groupVisible(this, g)) continue;
             TextView tab = text(g, 13, STEEL, semi);
             tab.setLetterSpacing(0.14f);
             tab.setPadding(dp(18), dp(8), dp(18), dp(8));
@@ -687,7 +702,10 @@ public class LauncherActivity extends Activity {
         else if (optionsGroup.equals("PERFORMANCE"))
             list.addView(note("For smooth play: Resolution 540p or 720p, Async pipelines ON, Async shaders ON, Big cores ON. "
                 + "The first match on each stage builds its shaders once; later starts load them."));
-        for (Settings.Opt o : Settings.ALL) if (o.group.equals(optionsGroup)) list.addView(optionRow(o, ini), llp(-1, -2, 6));
+        for (Settings.Opt o : Settings.ALL)
+            if (o.group.equals(optionsGroup) && !Settings.locked(this, o)) list.addView(optionRow(o, ini), llp(-1, -2, 6));
+        if (!Settings.devUnlocked(this) && optionsGroup.equals("DISPLAY"))
+            list.addView(note("Performance settings are set for the smoothest play and cannot be changed."), llp(-1, -2, 6));
         if (optionsGroup.equals("CONTROLS"))
             list.addView(actionRow("EDIT LAYOUT", "Move each part of the touch pad and set its own size and opacity.",
                 () -> startActivity(new Intent(this, ControlsEditorActivity.class))), llp(-1, -2, 6));
@@ -719,7 +737,8 @@ public class LauncherActivity extends Activity {
         labels.addView(help);
         row.addView(labels, new LinearLayout.LayoutParams(0, -2, 1f));
 
-        final int[] idx = { o.index(Settings.get(this, o, ini)) };
+        final int n = Settings.choices(this, o);
+        final int[] idx = { Math.min(o.index(Settings.get(this, o, ini)), n - 1) };
         TextView left = text("◀", 14, RED, bold);
         left.setPadding(dp(10), dp(6), dp(10), dp(6));
         TextView value = text(o.labels[idx[0]], 14, Color.WHITE, bold);
@@ -738,13 +757,13 @@ public class LauncherActivity extends Activity {
             }
             if (o.key.equals("no_anim")) { if (noAnim()) stopLoops(); else startLoops(); }
         };
-        left.setOnClickListener(v -> { idx[0] = (idx[0] + o.values.length - 1) % o.values.length; apply.run(); });
-        right.setOnClickListener(v -> { idx[0] = (idx[0] + 1) % o.values.length; apply.run(); });
-        row.setOnClickListener(v -> { idx[0] = (idx[0] + 1) % o.values.length; apply.run(); });
+        left.setOnClickListener(v -> { idx[0] = (idx[0] + n - 1) % n; apply.run(); });
+        right.setOnClickListener(v -> { idx[0] = (idx[0] + 1) % n; apply.run(); });
+        row.setOnClickListener(v -> { idx[0] = (idx[0] + 1) % n; apply.run(); });
         row.setOnKeyListener((v, code, ev) -> {
             if (ev.getAction() != KeyEvent.ACTION_DOWN) return false;
-            if (code == KeyEvent.KEYCODE_DPAD_LEFT) { idx[0] = (idx[0] + o.values.length - 1) % o.values.length; apply.run(); return true; }
-            if (code == KeyEvent.KEYCODE_DPAD_RIGHT) { idx[0] = (idx[0] + 1) % o.values.length; apply.run(); return true; }
+            if (code == KeyEvent.KEYCODE_DPAD_LEFT) { idx[0] = (idx[0] + n - 1) % n; apply.run(); return true; }
+            if (code == KeyEvent.KEYCODE_DPAD_RIGHT) { idx[0] = (idx[0] + 1) % n; apply.run(); return true; }
             return false;
         });
         row.setOnFocusChangeListener((v, f) -> row.setBackground(f ? focusPanel() : panel(175)));
@@ -786,9 +805,12 @@ public class LauncherActivity extends Activity {
         list.addView(actionRow(shadersBuilt(this) ? "BUILD SHADERS (DONE - CHECK FOR NEW)" : "BUILD SHADERS",
             "Prepares every graphics shader now (one time, 10-40 minutes) so matches start without missing stages or characters.", this::startShaderBuild), llp(-1, -2, 6));
         list.addView(actionRow("EDIT TOUCH CONTROLS", "Move, resize and fade each on-screen button.", () -> startActivity(new Intent(this, ControlsEditorActivity.class))), llp(-1, -2, 6));
+        list.addView(actionRow("SAVE LOGS", "Saves the logs as a zip in Download/TTT2 Logs on your phone, to send with a problem report.", this::exportDebug), llp(-1, -2, 6));
+        list.addView(actionRow("CHECK FOR UPDATES", "Asks volvisionmods.com for a newer version.",
+            () -> VolvisionUpdateChannel.checkNow(this, VolvisionUpdateChannel.versionName(this))), llp(-1, -2, 6));
         list.addView(actionRow("LOGS", "The crash report, the start of the log, important lines and the end.", this::showLog), llp(-1, -2, 6));
-        list.addView(actionRow("FRAMES", "The frames saved by DEBUG -> SAVE FRAMES.", this::showFrames), llp(-1, -2, 6));
-        list.addView(actionRow("EXPORT DEBUG", "Logs, frames and failed shaders as Download/ttt2-debug-<time>.zip, to attach to a report.", this::exportDebug), llp(-1, -2, 6));
+        if (Settings.devUnlocked(this))
+            list.addView(actionRow("FRAMES", "The frames saved by DEBUG -> SAVE FRAMES.", this::showFrames), llp(-1, -2, 6));
         list.addView(actionRow("CLEAR SHADER CACHE", "Deletes the compiled shaders and the Vulkan pipeline cache (they are built again while playing).", this::clearShaderCache), llp(-1, -2, 6));
         list.addView(actionRow("RESET ALL OPTIONS", "Every option back to its default (custom variables are kept).", () ->
             new AlertDialog.Builder(this).setTitle("Reset all options?").setPositiveButton("Reset", (d, w) -> {
@@ -812,12 +834,12 @@ public class LauncherActivity extends Activity {
     private void clearShaderCache() {
         File root = new File(dataRoot(this));
         int n = 0;
-        for (File d : new File[] { new File(root, "TTT2Recomp"), new File(root, "TTT2Recomp/shadercache"), new File(root, "TTT2Recomp/shadercache/ucode"), new File(root, "ttt2/port/shadercache-debug") }) {
+        for (File d : new File[] { new File(root, "TTT2Recomp"), new File(root, "TTT2Recomp/shadercache"), new File(root, "TTT2Recomp/shadercache/ucode"), new File(root, "ttt2/port/shadercache-debug"), new File(root, "TTT2Recomp/native_spv") }) {
             File[] files = d.listFiles();
             if (files == null) continue;
             for (File f : files) {
                 String s = f.getName();
-                if (f.isFile() && (s.endsWith(".dxbc") || s.endsWith(".dxvk-cache") || s.endsWith(".bin") || s.equals("prebuilt.txt")) && f.delete()) n++;
+                if (f.isFile() && (s.endsWith(".dxbc") || s.endsWith(".dxvk-cache") || s.endsWith(".bin") || s.endsWith(".spv") || s.equals("prebuilt.txt")) && f.delete()) n++;
             }
         }
         toastStatus("Shader cache cleared (" + n + " files).");
@@ -901,6 +923,22 @@ public class LauncherActivity extends Activity {
             list.addView(d);
         }
         col.addView(list, llp(-1, -2, 12));
+
+        // r28: the version; tapping it 7 times turns the developer settings on or off (for testing only).
+        TextView ver = text("VERSION " + VolvisionUpdateChannel.versionName(this) + (Settings.devUnlocked(this) ? "   (developer settings on)" : ""), 11, STEEL, semi);
+        ver.setLetterSpacing(0.15f);
+        ver.setPadding(dp(6), 0, dp(6), 0);
+        final int[] taps = { 0 };
+        ver.setOnClickListener(v -> {
+            if (++taps[0] < 7) return;
+            taps[0] = 0;
+            boolean on = !Settings.devUnlocked(this);
+            Settings.setDevUnlocked(this, on);
+            if (!on) Settings.enforce(this);
+            ver.setText("VERSION " + VolvisionUpdateChannel.versionName(this) + (on ? "   (developer settings on)" : ""));
+            toastStatus(on ? "Developer settings on (Options shows everything)." : "Developer settings off (tested values restored).");
+        });
+        col.addView(ver, llp(-1, -2, 12));
 
         TextView disc = text(Credits.DISCLAIMER, 10.5f, STEEL, regular);
         disc.setLineSpacing(0, 1.15f);
@@ -1152,6 +1190,7 @@ public class LauncherActivity extends Activity {
 
     private void play() {
         if (installing) return;
+        Settings.enforce(this);
         if (installed() && !shadersBuilt(this) && !prefs.getBoolean("skip_shader_prompt", false)) {
             new AlertDialog.Builder(this).setTitle("Build shaders first?")
                 .setMessage("Recommended once: every graphics shader is prepared now (10-40 minutes), so matches start with the stage and "
@@ -1253,30 +1292,50 @@ public class LauncherActivity extends Activity {
         for (File f : files) {
             if (f.isDirectory()) { zipDir(z, f, prefix + f.getName() + "/", maxEach); continue; }
             String n = f.getName();
-            if (n.endsWith(".dxbc") || n.endsWith(".bin") || f.length() > maxEach) continue;
+            if (n.endsWith(".dxbc") || n.endsWith(".bin") || n.endsWith(".spv") || n.endsWith(".tmp") || n.endsWith(".dxvk-cache") || f.length() > maxEach) continue;
+            if (prefix.endsWith("native_spv/")) continue;
             z.putNextEntry(new ZipEntry(prefix + n));
             try (InputStream in = new FileInputStream(f)) { int r; while ((r = in.read(buf)) > 0) z.write(buf, 0, r); }
             z.closeEntry();
         }
     }
 
-    /** Logs, the self-test, frame dumps and traced shaders as Download/ttt2-debug-<time>.zip, to attach to a message. */
+    /** r28: the logs, the self-test and settings as Download/TTT2 Logs/TTT2-Logs-<time>.zip (internal storage), in the background. */
     private void exportDebug() {
-        String name = "ttt2-debug-" + new java.text.SimpleDateFormat("MMdd-HHmmss", java.util.Locale.US).format(new java.util.Date()) + ".zip";
-        try {
-            ContentValues v = new ContentValues();
-            v.put(MediaStore.Downloads.DISPLAY_NAME, name);
-            v.put(MediaStore.Downloads.MIME_TYPE, "application/zip");
-            Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-            if (uri == null) throw new Exception("could not create the file in Download");
-            try (OutputStream os = getContentResolver().openOutputStream(uri); ZipOutputStream z = new ZipOutputStream(os)) {
-                zipDir(z, new File(dataRoot(this), "TTT2Recomp"), "TTT2Recomp/", 40_000_000L);
-                zipDir(z, new File(dataRoot(this), "ttt2/port"), "ttt2/port/", 40_000_000L);
+        final String name = "TTT2-Logs-" + new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(new java.util.Date()) + ".zip";
+        toastStatus("Saving logs…");
+        new Thread(() -> {
+            String msg;
+            try {
+                ContentValues v = new ContentValues();
+                v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                v.put(MediaStore.Downloads.MIME_TYPE, "application/zip");
+                v.put(MediaStore.Downloads.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS + "/TTT2 Logs");
+                v.put(MediaStore.Downloads.IS_PENDING, 1);
+                Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                if (uri == null) throw new Exception("could not create the file in Download");
+                try (OutputStream os = getContentResolver().openOutputStream(uri); ZipOutputStream z = new ZipOutputStream(os)) {
+                    z.putNextEntry(new ZipEntry("about.txt"));
+                    z.write(("Tekken Tag 2 for Android v" + VolvisionUpdateChannel.versionName(this) + "\n"
+                        + "Device: " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL + ", Android " + android.os.Build.VERSION.RELEASE + "\n"
+                        + "Saved: " + new java.util.Date() + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    z.closeEntry();
+                    zipDir(z, new File(dataRoot(this), "TTT2Recomp"), "TTT2Recomp/", 40_000_000L);
+                    zipDir(z, new File(dataRoot(this), "ttt2/port"), "ttt2/port/", 40_000_000L);
+                }
+                ContentValues done = new ContentValues();
+                done.put(MediaStore.Downloads.IS_PENDING, 0);
+                getContentResolver().update(uri, done, null, null);
+                msg = "Logs saved: Download/TTT2 Logs/" + name;
+            } catch (Exception e) {
+                msg = "Saving the logs failed: " + e.getMessage();
             }
-            toastStatus("Saved Download/" + name + " - attach it to your message.");
-        } catch (Exception e) {
-            toastStatus("Export failed: " + e);
-        }
+            final String m = msg;
+            runOnUiThread(() -> {
+                toastStatus(m);
+                if (!isFinishing()) new AlertDialog.Builder(this).setTitle("Logs").setMessage(m).setPositiveButton("OK", null).show();
+            });
+        }, "save-logs").start();
     }
 
     /** Debug: the game's rendered frame (fb_native.bmp) and the window's back buffer (fb_back.bmp). */

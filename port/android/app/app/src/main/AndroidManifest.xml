@@ -7,6 +7,11 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- r28: update check (volvisionmods.com) and online play; update notifications -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:label="Tekken Tag 2"
@@ -47,5 +52,11 @@
             android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:preferMinimalPostProcessing="true"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+
+        <!-- r28: checks volvisionmods.com about twice a day and notifies a new version -->
+        <service
+            android:name=".UpdateJob"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>

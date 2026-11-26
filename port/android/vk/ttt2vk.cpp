@@ -26,6 +26,8 @@
 #include <condition_variable>
 #include <thread>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -667,6 +669,7 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
     std::vector<std::pair<VkImage, VkImageAspectFlags>> newImages;
     // One-off submissions (initial data from any thread).
     std::mutex oneOffMutex;
+    std::atomic<bool> vsSamplesImages{ false };     // r28: a vertex shader with a texture: pass barriers include vertex shaders
     VkCommandPool oneOffPool = VK_NULL_HANDLE;
     std::string gpuName;
     // r26: pipelines built on worker threads (async) and a pipeline cache kept on disk between runs.
@@ -707,6 +710,12 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
     // Records `record` into a command buffer of its own, submits it and waits (initial data).
     void OneOff(const std::function<void(VkCommandBuffer)>& record);
     bool CompileShader(const void* code, SIZE_T size, bool vertex, ShaderCode& out);
+    void NoteVertexTextures(const ShaderCode& c)
+    {
+        for (const Binding& b : c.bindings)
+            if (b.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && !vsSamplesImages.exchange(true))
+                std::fprintf(stderr, "[native-vk] a vertex shader samples a texture: render pass barriers include vertex shaders\n");
+    }
 
     // ---- ID3D11Device
     HRESULT STDMETHODCALLTYPE CreateBuffer(const D3D11_BUFFER_DESC* desc, const D3D11_SUBRESOURCE_DATA* init, ID3D11Buffer** out) override;
@@ -1144,7 +1153,27 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         if (!inPass) return;
         vkCmdEndRenderPass(cmd);
         inPass = false;
-        Barrier();
+        PassBarrier();
+    }
+    // r28: after a render pass, only its attachment writes are made visible to what reads them next (fragment
+    // shaders, attachments, copies). The full ALL_COMMANDS barrier made the GPU go idle between each of ~43 passes a
+    // frame, so the next pass's vertex work never overlapped the last one's pixels. Vertex shaders are included only
+    // once one samples an image (none did in testing); TTT2_NATIVE_FULL_BARRIERS=1 brings the full barrier back.
+    void PassBarrier()
+    {
+        static const bool full = [] { const char* e = std::getenv("TTT2_NATIVE_FULL_BARRIERS"); return e && *e == '1'; }();
+        if (full) { Barrier(); return; }
+        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        VkPipelineStageFlags dst = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        if (device->vsSamplesImages.load(std::memory_order_relaxed)) dst |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
     // New images to GENERAL (outside any render pass).
     void FlushNewImages(bool endPass = true)
@@ -2495,6 +2524,11 @@ void Device::SavePipelineCache(bool wait)
 
 void Device::OneOff(const std::function<void(VkCommandBuffer)>& record)
 {
+    // r28: no longer waits. A texture or buffer created with data used to wait for the GPU here - behind the whole
+    // frame already queued (r27 log: "textures 18.6 ms, of which uploads 17.4" frames at match start). The work is
+    // submitted now; the queue runs it before anything submitted later, and the barrier at its end makes its writes
+    // visible to that later work. Its command buffer and fence are freed once the context's next submission is done
+    // (a fence signals only after all work submitted before it).
     std::lock_guard l(oneOffMutex);
     VkCommandBufferAllocateInfo a{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     a.commandPool = oneOffPool;
@@ -2506,6 +2540,10 @@ void Device::OneOff(const std::function<void(VkCommandBuffer)>& record)
     b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(c, &b);
     record(c);
+    VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     vkEndCommandBuffer(c);
     VkFenceCreateInfo fi{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkFence f;
@@ -2513,13 +2551,30 @@ void Device::OneOff(const std::function<void(VkCommandBuffer)>& record)
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
     si.pCommandBuffers = &c;
+    static const bool wait = [] { const char* e = std::getenv("TTT2_NATIVE_ONEOFF_WAIT"); return e && *e == '1'; }();
+    uint64_t after;
     {
         std::lock_guard q(core.queueMutex);
         vkQueueSubmit(core.queue, 1, &si, f);
+        after = core.next.load();       // the context's next submission: queued after this one
     }
-    vkWaitForFences(core.dev, 1, &f, VK_TRUE, 10000000000ull);
-    vkDestroyFence(core.dev, f, nullptr);
-    vkFreeCommandBuffers(core.dev, oneOffPool, 1, &c);
+    if (wait)
+    {
+        vkWaitForFences(core.dev, 1, &f, VK_TRUE, 10000000000ull);
+        vkDestroyFence(core.dev, f, nullptr);
+        vkFreeCommandBuffers(core.dev, oneOffPool, 1, &c);
+        return;
+    }
+    VkDevice dev = core.dev;
+    VkCommandPool pool = oneOffPool;
+    std::mutex* mtx = &oneOffMutex;
+    std::lock_guard d(core.deferMutex);
+    core.deferred.emplace_back(after, [dev, pool, mtx, c, f] {
+        vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ull);   // done already (its successor finished); cheap
+        vkDestroyFence(dev, f, nullptr);
+        std::lock_guard l(*mtx);
+        vkFreeCommandBuffers(dev, pool, 1, &c);
+    });
 }
 
 HRESULT Device::CreateBuffer(const D3D11_BUFFER_DESC* desc, const D3D11_SUBRESOURCE_DATA* init, ID3D11Buffer** out)
@@ -2865,8 +2920,137 @@ HRESULT Device::CreateSamplerState(const D3D11_SAMPLER_DESC* desc, ID3D11Sampler
 }
 
 // ---------------------------------------------------------------- shaders through vkd3d-shader
+// r28: SPIR-V kept on disk (TTT2Recomp/native_spv/<hash>.spv): the start-up shader warm-up converted all 5632 pixel
+// shaders from DXBC again on every run (r27 log: 17.9 s on 4 threads, competing with the menu for the CPU).
+namespace spvcache {
+static std::string Dir()
+{
+    static const std::string d = [] {
+        const char* la = std::getenv("LOCALAPPDATA");
+        if (!la || std::getenv("TTT2_NATIVE_NO_SPV_CACHE")) return std::string();
+        std::string p = std::string(la) + "/TTT2Recomp/native_spv";
+        mkdir((std::string(la) + "/TTT2Recomp").c_str(), 0755);
+        mkdir(p.c_str(), 0755);
+        return p;
+    }();
+    return d;
+}
+static std::string Path(const void* code, size_t size, bool vertex, uint32_t dynLimit)
+{
+    const std::string d = Dir();
+    if (d.empty()) return d;
+    uint64_t h = 1469598103934665603ull, h2 = 0x9E3779B97F4A7C15ull;
+    const uint8_t* p = static_cast<const uint8_t*>(code);
+    for (size_t i = 0; i < size; ++i) { h = (h ^ p[i]) * 1099511628211ull; h2 = (h2 + p[i]) * 0x100000001B3ull ^ (h2 >> 29); }
+    char name[96];
+    std::snprintf(name, sizeof(name), "/%016llx%08llx_%zx_%c%u_v1.spv", (unsigned long long)h, (unsigned long long)(h2 & 0xFFFFFFFFull),
+                  size, vertex ? 'v' : 'p', dynLimit);
+    return d + name;
+}
+struct Rec { std::vector<Binding> bindings; std::vector<std::pair<std::string, uint32_t>> inputs; uint32_t dynamicCount = 0; std::vector<uint32_t> spv; };
+static bool Load(const std::string& path, Rec& r)
+{
+    if (path.empty()) return false;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::vector<uint8_t> b;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (n > 16 && n < (8l << 20)) { b.resize(size_t(n)); if (std::fread(b.data(), 1, b.size(), f) != b.size()) b.clear(); }
+    std::fclose(f);
+    size_t at = 0;
+    auto u32 = [&](uint32_t& v) { if (at + 4 > b.size()) return false; std::memcpy(&v, b.data() + at, 4); at += 4; return true; };
+    uint32_t magic, nb, ni, ns;
+    if (!u32(magic) || magic != 0x56505354u || !u32(r.dynamicCount) || !u32(nb) || nb > 256) return false;
+    for (uint32_t i = 0; i < nb; ++i)
+    {
+        Binding x{}; uint32_t t;
+        if (!u32(x.kind) || !u32(x.reg) || !u32(x.binding) || !u32(t)) return false;
+        x.type = VkDescriptorType(t);
+        r.bindings.push_back(x);
+    }
+    if (!u32(ni) || ni > 64) return false;
+    for (uint32_t i = 0; i < ni; ++i)
+    {
+        uint32_t len, reg;
+        if (!u32(len) || len > 256 || at + len > b.size()) return false;
+        std::string name(reinterpret_cast<const char*>(b.data() + at), len);
+        at += len;
+        if (!u32(reg)) return false;
+        r.inputs.emplace_back(name, reg);
+    }
+    if (!u32(ns) || !ns || ns % 4 || at + ns != b.size()) return false;
+    r.spv.resize(ns / 4);
+    std::memcpy(r.spv.data(), b.data() + at, ns);
+    return r.spv[0] == 0x07230203u;     // SPIR-V magic
+}
+static void Store(const std::string& path, const ShaderCode& c, const void* spv, size_t spvSize)
+{
+    if (path.empty()) return;
+    std::vector<uint8_t> b;
+    auto u32 = [&](uint32_t v) { const size_t at = b.size(); b.resize(at + 4); std::memcpy(b.data() + at, &v, 4); };
+    u32(0x56505354u); u32(c.dynamicCount); u32(uint32_t(c.bindings.size()));
+    for (const Binding& x : c.bindings) { u32(x.kind); u32(x.reg); u32(x.binding); u32(uint32_t(x.type)); }
+    u32(uint32_t(c.inputs.size()));
+    for (const auto& in : c.inputs) { u32(uint32_t(in.first.size())); b.insert(b.end(), in.first.begin(), in.first.end()); u32(in.second); }
+    u32(uint32_t(spvSize));
+    b.insert(b.end(), static_cast<const uint8_t*>(spv), static_cast<const uint8_t*>(spv) + spvSize);
+    char tmp[32];
+    std::snprintf(tmp, sizeof(tmp), ".%lx.tmp", (long)gettid());
+    const std::string t = path + tmp;
+    if (FILE* f = std::fopen(t.c_str(), "wb"))
+    {
+        const bool ok = std::fwrite(b.data(), 1, b.size(), f) == b.size();
+        std::fclose(f);
+        if (!ok || std::rename(t.c_str(), path.c_str()) != 0) std::remove(t.c_str());
+    }
+}
+static std::atomic<uint64_t> hits{0}, misses{0};
+}
+
+// The cached form back into a shader: module, set layout (from the bindings), inputs.
+static bool FromCache(Core& core, bool vertex, spvcache::Rec& r, ShaderCode& out)
+{
+    VkShaderModuleCreateInfo mi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    mi.codeSize = r.spv.size() * 4;
+    mi.pCode = r.spv.data();
+    if (vkCreateShaderModule(core.dev, &mi, nullptr, &out.module) != VK_SUCCESS) return false;
+    std::vector<VkDescriptorSetLayoutBinding> lb;
+    for (const Binding& b : r.bindings)
+    {
+        VkDescriptorSetLayoutBinding l{};
+        l.binding = b.binding & 0x7FFF;
+        l.descriptorType = b.type;
+        l.descriptorCount = 1;
+        l.stageFlags = vertex ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+        lb.push_back(l);
+    }
+    VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    lci.bindingCount = uint32_t(lb.size());
+    lci.pBindings = lb.data();
+    vkCreateDescriptorSetLayout(core.dev, &lci, nullptr, &out.layout);
+    out.bindings = std::move(r.bindings);
+    out.inputs = std::move(r.inputs);
+    out.dynamicCount = r.dynamicCount;
+    return true;
+}
+
 bool Device::CompileShader(const void* code, SIZE_T size, bool vertex, ShaderCode& out)
 {
+    const uint32_t dynLimit = std::min<uint32_t>(8, core.props.limits.maxDescriptorSetUniformBuffersDynamic / 2);
+    const std::string cachePath = spvcache::Path(code, size, vertex, dynLimit);
+    {
+        spvcache::Rec rec;
+        if (spvcache::Load(cachePath, rec) && FromCache(core, vertex, rec, out))
+        {
+            ++spvcache::hits;
+            if (vertex) NoteVertexTextures(out);
+            out.id = ids++;
+            return true;
+        }
+    }
+    ++spvcache::misses;
     vkd3d_shader_compile_info info{};
     info.type = VKD3D_SHADER_STRUCTURE_TYPE_COMPILE_INFO;
     info.source.code = code;
@@ -2906,7 +3090,7 @@ bool Device::CompileShader(const void* code, SIZE_T size, bool vertex, ShaderCod
             b.kind = 0; rb.flags = VKD3D_SHADER_BINDING_FLAG_BUFFER;
             // r26: dynamic offsets (the set is reused while only the constant ring's offset moves), within the
             // device's limit shared by the two stages.
-            if (out.dynamicCount < std::min<uint32_t>(8, core.props.limits.maxDescriptorSetUniformBuffersDynamic / 2))
+            if (out.dynamicCount < dynLimit)
             { b.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; ++out.dynamicCount; }
             else b.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             break;
@@ -2955,6 +3139,7 @@ bool Device::CompileShader(const void* code, SIZE_T size, bool vertex, ShaderCod
     mi.codeSize = spv.size;
     mi.pCode = static_cast<const uint32_t*>(spv.code);
     const VkResult vr = vkCreateShaderModule(core.dev, &mi, nullptr, &out.module);
+    std::vector<uint8_t> spvCopy(static_cast<const uint8_t*>(spv.code), static_cast<const uint8_t*>(spv.code) + spv.size);
     vkd3d_shader_free_shader_code(&spv);
     if (vr != VK_SUCCESS) return false;
     VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
@@ -2977,6 +3162,8 @@ bool Device::CompileShader(const void* code, SIZE_T size, bool vertex, ShaderCod
             vkd3d_shader_free_shader_signature(&sig);
         }
     }
+    spvcache::Store(cachePath, out, spvCopy.data(), spvCopy.size());
+    if (vertex) NoteVertexTextures(out);
     out.id = ids++;
     return true;
 }
@@ -3412,6 +3599,9 @@ struct SwapChain : Com<Stub_IDXGISwapChain1<IDXGISwapChain1>>
             if (ctx->skippedDraws || ctx->asyncPipelines || ctx->syncPipelines)
                 Log("last 300 frames: %llu pipelines built at once, %llu in the background, %llu draws waited for one",
                     (unsigned long long)ctx->syncPipelines, (unsigned long long)ctx->asyncPipelines, (unsigned long long)ctx->skippedDraws);
+            if (spvcache::misses.load() || spvcache::hits.load())
+                Log("shaders: %llu from the SPIR-V cache, %llu converted (and stored)",
+                    (unsigned long long)spvcache::hits.exchange(0), (unsigned long long)spvcache::misses.exchange(0));
             Log("per frame: %.1f render passes (attachments loaded: %.1f colour, %.1f depth; %.1f cleared at load), %.1f submits",
                 ctx->statPasses / 300.0, ctx->statColorLoads / 300.0, ctx->statDepthLoads / 300.0, ctx->statClearLoads / 300.0,
                 ctx->statSubmits / 300.0);

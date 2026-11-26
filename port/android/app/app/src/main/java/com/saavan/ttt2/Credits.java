@@ -23,6 +23,7 @@ final class Credits {
 
     /** The work this app is built on. */
     static final String[][] THANKS = {
+            {"Claude (Anthropic)", "AI coding partner: helped build the Android runtime, the native Vulkan renderer, the touch controls and this launcher with Catonix"},
             {"Tekken Tag Tournament 2 PC recompilation", "shihabal3amri and contributors - the PC port this Android version is built on"},
             {"XenonRecomp", "hedge-dev: the Xbox 360 static recompiler (MIT)"},
             {"References", "Unleashed Recompiled (hedge-dev) and the Xenia project"},
