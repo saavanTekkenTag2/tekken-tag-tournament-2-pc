@@ -187,6 +187,8 @@ final class Settings {
             "no_anim"));
     /** Resolution choices when locked: 360p, 540p, 720p (900p and up are too slow on phones). */
     private static final int BASIC_RESOLUTIONS = 3;
+    /** r29: Mali GPUs: 360p and 540p (720p is too slow on them). */
+    private static final int MALI_RESOLUTIONS = 2;
     static final Set<String> HIDDEN_GROUPS = new HashSet<>(Arrays.asList("PERFORMANCE", "DEBUG"));
 
     static boolean devUnlocked(Context c) { return c.getSharedPreferences("ttt2", Context.MODE_PRIVATE).getBoolean("dev_unlock", false); }
@@ -195,7 +197,8 @@ final class Settings {
     static boolean groupVisible(Context c, String g) { return devUnlocked(c) || !HIDDEN_GROUPS.contains(g); }
     /** How many of an option's values can be picked. */
     static int choices(Context c, Opt o) {
-        if (o.key.equals("Resolution") && o.store == INI && !devUnlocked(c)) return Math.min(BASIC_RESOLUTIONS, o.values.length);
+        if (o.key.equals("Resolution") && o.store == INI && !devUnlocked(c))
+            return Math.min(GpuInfo.isMali(c) ? MALI_RESOLUTIONS : BASIC_RESOLUTIONS, o.values.length);
         return o.values.length;
     }
 
@@ -230,6 +233,15 @@ final class Settings {
             else e.remove(o.key);
         }
         e.putBoolean("release_defaults_1", true);
+        // r29: Mali GPUs start lighter once (360p, no shadows, depth of field or light shafts); players can turn them on.
+        if (!p.getBoolean("mali_defaults_1", false) && GpuInfo.isMali(c)) {
+            iniPut(ini, "Display", "Resolution", "640x360");
+            iniPut(ini, "Display", "Shadows", "0");
+            iniPut(ini, "Display", "DepthOfField", "0");
+            iniPut(ini, "Display", "LightShafts", "0");
+            iniChanged = true;
+        }
+        e.putBoolean("mali_defaults_1", true);
         e.apply();
         if (iniChanged) writeIni(c, ini);
     }

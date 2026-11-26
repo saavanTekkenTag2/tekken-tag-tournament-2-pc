@@ -266,7 +266,12 @@ struct UploadHeap
 };
 
 // ================================================================ formats
-struct FormatInfo { VkFormat vk; uint32_t bytes; uint32_t block; VkImageAspectFlags aspect; };
+// r29: decode = this DXGI format is stored decoded (1 BC1 -> A1R5G5B5, 2 BC2 / 3 BC3 -> RGBA8, 4 BC4 -> R8, 5 BC5 -> RG8):
+// GPUs without BC textures (every Mali: "no BC textures!") were given BC images anyway, which the Vulkan spec leaves
+// undefined - on Mali-G57/G68 the driver crashed on the command processor thread at boot, or textures were missing.
+struct FormatInfo { VkFormat vk; uint32_t bytes; uint32_t block; VkImageAspectFlags aspect; uint8_t decode = 0; };
+static bool g_decodeBC = false;         // set once at device creation, before any texture
+static bool g_d24AsD32 = false;         // r29: D24S8 cannot be a depth attachment here: D32S8 instead
 static FormatInfo Format(DXGI_FORMAT f)
 {
     const VkImageAspectFlags C = VK_IMAGE_ASPECT_COLOR_BIT, DS = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -306,22 +311,106 @@ static FormatInfo Format(DXGI_FORMAT f)
     case DXGI_FORMAT_R8_UNORM: return { VK_FORMAT_R8_UNORM, 1, 1, C };
     case DXGI_FORMAT_R8_UINT: return { VK_FORMAT_R8_UINT, 1, 1, C };
     case DXGI_FORMAT_A8_UNORM: return { VK_FORMAT_R8_UNORM, 1, 1, C };
-    case DXGI_FORMAT_BC1_UNORM: return { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4, C };
-    case DXGI_FORMAT_BC2_UNORM: return { VK_FORMAT_BC2_UNORM_BLOCK, 16, 4, C };
-    case DXGI_FORMAT_BC3_UNORM: return { VK_FORMAT_BC3_UNORM_BLOCK, 16, 4, C };
-    case DXGI_FORMAT_BC4_UNORM: return { VK_FORMAT_BC4_UNORM_BLOCK, 8, 4, C };
-    case DXGI_FORMAT_BC5_UNORM: return { VK_FORMAT_BC5_UNORM_BLOCK, 16, 4, C };
+    case DXGI_FORMAT_BC1_UNORM: if (g_decodeBC) return { VK_FORMAT_A1R5G5B5_UNORM_PACK16, 2, 1, C, 1 };
+                                return { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 4, C };
+    case DXGI_FORMAT_BC2_UNORM: if (g_decodeBC) return { VK_FORMAT_R8G8B8A8_UNORM, 4, 1, C, 2 };
+                                return { VK_FORMAT_BC2_UNORM_BLOCK, 16, 4, C };
+    case DXGI_FORMAT_BC3_UNORM: if (g_decodeBC) return { VK_FORMAT_R8G8B8A8_UNORM, 4, 1, C, 3 };
+                                return { VK_FORMAT_BC3_UNORM_BLOCK, 16, 4, C };
+    case DXGI_FORMAT_BC4_UNORM: if (g_decodeBC) return { VK_FORMAT_R8_UNORM, 1, 1, C, 4 };
+                                return { VK_FORMAT_BC4_UNORM_BLOCK, 8, 4, C };
+    case DXGI_FORMAT_BC5_UNORM: if (g_decodeBC) return { VK_FORMAT_R8G8_UNORM, 2, 1, C, 5 };
+                                return { VK_FORMAT_BC5_UNORM_BLOCK, 16, 4, C };
     case DXGI_FORMAT_R32G8X24_TYPELESS:
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return { VK_FORMAT_D32_SFLOAT_S8_UINT, 8, 1, DS };
     case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: return { VK_FORMAT_D32_SFLOAT_S8_UINT, 8, 1, VK_IMAGE_ASPECT_DEPTH_BIT };
     case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: return { VK_FORMAT_D32_SFLOAT_S8_UINT, 8, 1, VK_IMAGE_ASPECT_STENCIL_BIT };
     case DXGI_FORMAT_D32_FLOAT: return { VK_FORMAT_D32_SFLOAT, 4, 1, VK_IMAGE_ASPECT_DEPTH_BIT };
     case DXGI_FORMAT_R24G8_TYPELESS:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT: return { VK_FORMAT_D24_UNORM_S8_UINT, 4, 1, DS };
-    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: return { VK_FORMAT_D24_UNORM_S8_UINT, 4, 1, VK_IMAGE_ASPECT_DEPTH_BIT };
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: if (g_d24AsD32) return { VK_FORMAT_D32_SFLOAT_S8_UINT, 8, 1, DS };
+                                        return { VK_FORMAT_D24_UNORM_S8_UINT, 4, 1, DS };
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: if (g_d24AsD32) return { VK_FORMAT_D32_SFLOAT_S8_UINT, 8, 1, VK_IMAGE_ASPECT_DEPTH_BIT };
+                                            return { VK_FORMAT_D24_UNORM_S8_UINT, 4, 1, VK_IMAGE_ASPECT_DEPTH_BIT };
     default: return { VK_FORMAT_UNDEFINED, 0, 1, C };
     }
 }
+// r29: BC1-5 blocks to the decoded formats above, on the CPU at upload (src: rows of 4x4 blocks, srcPitch bytes each).
+namespace bcdec {
+static void Color(const uint8_t* b, bool four, uint8_t out[16][4])
+{
+    const uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
+    uint8_t p[4][4];
+    auto unpack = [](uint16_t c, uint8_t* o) {
+        const uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, bl = c & 31;
+        o[0] = uint8_t(r << 3 | r >> 2); o[1] = uint8_t(g << 2 | g >> 4); o[2] = uint8_t(bl << 3 | bl >> 2); o[3] = 255;
+    };
+    unpack(c0, p[0]); unpack(c1, p[1]);
+    if (four || c0 > c1)
+        for (int k = 0; k < 3; ++k)
+        {
+            p[2][k] = uint8_t((2 * p[0][k] + p[1][k] + 1) / 3);
+            p[3][k] = uint8_t((p[0][k] + 2 * p[1][k] + 1) / 3);
+        }
+    else
+        for (int k = 0; k < 3; ++k) { p[2][k] = uint8_t((p[0][k] + p[1][k] + 1) / 2); p[3][k] = 0; }
+    p[2][3] = 255;
+    p[3][3] = (four || c0 > c1) ? 255 : 0;
+    const uint32_t idx = uint32_t(b[4] | b[5] << 8 | b[6] << 16 | uint32_t(b[7]) << 24);
+    for (int i = 0; i < 16; ++i) std::memcpy(out[i], p[(idx >> (2 * i)) & 3], 4);
+}
+static void Channel(const uint8_t* b, uint8_t out[16][4], int ch)      // a BC4 block into channel ch
+{
+    const uint32_t a0 = b[0], a1 = b[1];
+    uint8_t v[8];
+    v[0] = uint8_t(a0); v[1] = uint8_t(a1);
+    if (a0 > a1) for (int i = 1; i < 7; ++i) v[i + 1] = uint8_t(((7 - i) * a0 + i * a1 + 3) / 7);
+    else { for (int i = 1; i < 5; ++i) v[i + 1] = uint8_t(((5 - i) * a0 + i * a1 + 2) / 5); v[6] = 0; v[7] = 255; }
+    uint64_t bits = 0;
+    for (int i = 0; i < 6; ++i) bits |= uint64_t(b[2 + i]) << (8 * i);
+    for (int i = 0; i < 16; ++i) out[i][ch] = v[(bits >> (3 * i)) & 7];
+}
+static void Decode(uint8_t kind, const uint8_t* src, uint32_t srcPitch, uint32_t w, uint32_t h, uint8_t* dst, uint32_t dstPitch)
+{
+    const uint32_t blockBytes = (kind == 1 || kind == 4) ? 8 : 16;
+    for (uint32_t by = 0; by * 4 < h; ++by)
+        for (uint32_t bx = 0; bx * 4 < w; ++bx)
+        {
+            const uint8_t* b = src + size_t(by) * srcPitch + size_t(bx) * blockBytes;
+            uint8_t t[16][4];
+            switch (kind)
+            {
+            case 1: Color(b, false, t); break;
+            case 2:
+                Color(b + 8, true, t);
+                for (int i = 0; i < 16; ++i) { const uint32_t a = (b[i / 2] >> (4 * (i & 1))) & 15; t[i][3] = uint8_t(a * 17); }
+                break;
+            case 3: Color(b + 8, true, t); Channel(b, t, 3); break;
+            case 4: Channel(b, t, 0); break;
+            default: Channel(b, t, 0); Channel(b + 8, t, 1); break;
+            }
+            for (uint32_t y = 0; y < 4 && by * 4 + y < h; ++y)
+                for (uint32_t x = 0; x < 4 && bx * 4 + x < w; ++x)
+                {
+                    const uint8_t* c = t[y * 4 + x];
+                    uint8_t* o = dst + size_t(by * 4 + y) * dstPitch;
+                    const uint32_t px = bx * 4 + x;
+                    switch (kind)
+                    {
+                    case 1:
+                    {
+                        const uint16_t v = uint16_t((c[3] >= 128 ? 0x8000u : 0u) | (uint32_t(c[0] >> 3) << 10) | (uint32_t(c[1] >> 3) << 5) | (c[2] >> 3));
+                        std::memcpy(o + px * 2, &v, 2);
+                        break;
+                    }
+                    case 4: o[px] = c[0]; break;
+                    case 5: o[px * 2] = c[0]; o[px * 2 + 1] = c[1]; break;
+                    default: std::memcpy(o + px * 4, c, 4); break;
+                    }
+                }
+        }
+}
+}
+
 static bool IsDepth(VkFormat f) { return f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_D24_UNORM_S8_UINT; }
 static VkImageAspectFlags FullAspect(VkFormat f)
 {
@@ -2145,6 +2234,8 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         const uint32_t rows = (h + bw - 1) / bw, rowBytes = (w + bw - 1) / bw * t->fmt.bytes;
         Slice s = device->heap.Alloc(VkDeviceSize(rows) * rowBytes, 16);
         if (!s.chunk) return;
+        if (t->fmt.decode) bcdec::Decode(t->fmt.decode, static_cast<const uint8_t*>(data), rowPitch, w, h, s.ptr(), rowBytes);
+        else
         for (uint32_t r = 0; r < rows; ++r) std::memcpy(s.ptr() + size_t(r) * rowBytes, static_cast<const uint8_t*>(data) + size_t(r) * rowPitch, rowBytes);
         VkCommandBuffer c = Transfer();
         VkBufferImageCopy r{};
@@ -2379,6 +2470,13 @@ bool Device::Init()
     vkGetPhysicalDeviceFeatures(core.phys, &sup);
     core.enabled.samplerAnisotropy = sup.samplerAnisotropy;
     core.enabled.textureCompressionBC = sup.textureCompressionBC;
+    {
+        const char* e = std::getenv("TTT2_NATIVE_DECODE_BC");     // 1 = decode even where BC is supported (testing)
+        g_decodeBC = !sup.textureCompressionBC || (e && *e == '1');
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(core.phys, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+        g_d24AsD32 = !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    }
     core.enabled.depthClamp = sup.depthClamp;
     core.enabled.depthBiasClamp = sup.depthBiasClamp;
     core.enabled.independentBlend = sup.independentBlend;
@@ -2452,6 +2550,41 @@ bool Device::Init()
     Log("device: %s, Vulkan %u.%u.%u, driver %08X%s%s", gpuName.c_str(), VK_VERSION_MAJOR(core.props.apiVersion), VK_VERSION_MINOR(core.props.apiVersion),
         VK_VERSION_PATCH(core.props.apiVersion), core.props.driverVersion, sup.textureCompressionBC ? "" : " (no BC textures!)",
         sup.depthClamp ? "" : " (no depth clamp)");
+    // r29: what this GPU cannot do with the formats the game uses, so a phone's log shows why something is missing.
+    if (g_decodeBC) Log("BC textures are decoded on upload (BC1 -> A1R5G5B5, BC2/BC3 -> RGBA8, BC4 -> R8, BC5 -> RG8)");
+    if (g_d24AsD32) Log("D24S8 is not a depth format here: D32S8 is used instead");
+    {
+        struct Want { DXGI_FORMAT f; const char* name; bool rt; };
+        static const Want wants[] = {
+            { DXGI_FORMAT_R8G8B8A8_UNORM, "RGBA8", true }, { DXGI_FORMAT_B8G8R8A8_UNORM, "BGRA8", true },
+            { DXGI_FORMAT_R10G10B10A2_UNORM, "RGB10A2", true }, { DXGI_FORMAT_R11G11B10_FLOAT, "R11G11B10F", true },
+            { DXGI_FORMAT_R16G16B16A16_FLOAT, "RGBA16F", true }, { DXGI_FORMAT_R16G16B16A16_UNORM, "RGBA16", true },
+            { DXGI_FORMAT_R32G32B32A32_FLOAT, "RGBA32F", false }, { DXGI_FORMAT_R32_FLOAT, "R32F", true },
+            { DXGI_FORMAT_R16G16_FLOAT, "RG16F", true }, { DXGI_FORMAT_R16G16_UNORM, "RG16", true }, { DXGI_FORMAT_R8_UNORM, "R8", true },
+            { DXGI_FORMAT_R8G8_UNORM, "RG8", true }, { DXGI_FORMAT_B5G6R5_UNORM, "R5G6B5", false }, { DXGI_FORMAT_B5G5R5A1_UNORM, "A1R5G5B5", false },
+            { DXGI_FORMAT_R16_UNORM, "R16", false }, { DXGI_FORMAT_R16_FLOAT, "R16F", true }, { DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, "RGBA8 sRGB", true },
+            { DXGI_FORMAT_BC1_UNORM, "BC1", false }, { DXGI_FORMAT_BC3_UNORM, "BC3", false }, { DXGI_FORMAT_BC5_UNORM, "BC5", false },
+            { DXGI_FORMAT_D24_UNORM_S8_UINT, "D24S8", true }, { DXGI_FORMAT_D32_FLOAT_S8X24_UINT, "D32S8", true }, { DXGI_FORMAT_D32_FLOAT, "D32", true },
+        };
+        std::string missing;
+        for (const Want& w : wants)
+        {
+            const FormatInfo fi = Format(w.f);
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(core.phys, fi.vk, &fp);
+            const VkFormatFeatureFlags ft = fp.optimalTilingFeatures;
+            const bool depth = IsDepth(fi.vk);
+            std::string m;
+            if (!(ft & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) m += " sample";
+            else if (!depth && !(ft & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) m += " filter";
+            if (w.rt && depth && !(ft & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) m += " depth";
+            if (w.rt && !depth && !(ft & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) m += " render";
+            if (w.rt && !depth && (ft & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !(ft & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) m += " blend";
+            if (!m.empty()) missing += std::string(missing.empty() ? "" : ";") + " " + w.name + ":" + m;
+        }
+        if (!missing.empty()) Log("formats without:%s", missing.c_str());
+        else Log("formats: everything the game uses is supported");
+    }
     return true;
 }
 
@@ -2711,6 +2844,9 @@ HRESULT Device::CreateTexture2D(const D3D11_TEXTURE2D_DESC* desc, const D3D11_SU
                 if (!d.pSysMem) continue;
                 const uint32_t rows = t->Rows(m), rowBytes = t->RowPitch(m);
                 Slice s = heap.Alloc(VkDeviceSize(rows) * rowBytes, 16);
+                if (fi.decode)
+                    bcdec::Decode(fi.decode, static_cast<const uint8_t*>(d.pSysMem), d.SysMemPitch, t->W(m), t->H(m), s.ptr(), rowBytes);
+                else
                 for (uint32_t y = 0; y < rows; ++y)
                     std::memcpy(s.ptr() + size_t(y) * rowBytes, static_cast<const uint8_t*>(d.pSysMem) + size_t(y) * d.SysMemPitch, rowBytes);
                 VkBufferImageCopy c{};
