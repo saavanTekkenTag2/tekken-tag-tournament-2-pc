@@ -3165,6 +3165,7 @@ void GpuPrescanKicked(bool scan, void (*note)(int kind, uint32_t addr, uint32_t 
     const uint32_t rb = g_ringBase, rs = g_ringSize;
     if (!rb || !rs) return;
     const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    std::atomic_thread_fence(std::memory_order_acquire);    // r27: the packets' words after the doorbell (ARM64)
     uint32_t wptrOff;
     if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;
     else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
@@ -3186,6 +3187,21 @@ void GpuPrescanKicked(bool scan, void (*note)(int kind, uint32_t addr, uint32_t 
 }
 
 void LowLatencyRingRead(uint32_t from, uint32_t to, uint32_t size);   // low_latency.cpp
+// r27: where the game's published commands end, read with ACQUIRE ordering. The game writes a packet, then
+// eieio (a release fence in the recompiled code), then the doorbell. On ARM64 the command processor's later loads of
+// the packet could still be served before its load of the doorbell, so it read the ring's OLD words (MEASURED r26:
+// "[pm4-fault] invalid published ring packet ... h=13E4B680" after 7 minutes of play, then the process stopped).
+static bool ReadPublishedWptr(uint32_t rb, uint32_t rs, uint32_t& wptrOff)
+{
+    const uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;   // dword index, including zero
+    else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
+    else return false;
+    return true;
+}
+static std::atomic<uint32_t> g_pm4Retried{0}, g_pm4Resynced{0};
+
 static void ConsumeRing()
 {
     frame_overlap::MarkCpThread();                      // never waits in the frame overlap's write guard
@@ -3193,17 +3209,13 @@ static void ConsumeRing()
     if (!rb || !rs) return;
     // Consume only what the game PUBLISHED via the CP_RB_WPTR doorbell (MMIO 0x7FC80714,
     // dword index; mirrored at device+11088) - the CPU cursor at device+48 races the writes.
-    uint32_t doorbell = GRead32(g_base, 0x7FC80714u);
     uint32_t wptrOff;
-    if ((uint64_t)doorbell * 4 < rs) wptrOff = doorbell * 4;   // dword index, including zero
-    else if (doorbell >= rb && uint64_t(doorbell) < uint64_t(rb) + rs) wptrOff = doorbell - rb;
-    else return;
+    if (!ReadPublishedWptr(rb, rs, wptrOff)) return;
     const uint32_t from = g_ringRptr.load();
     if (wptrOff == from) return;
     g_cpSyncEpoch.fetch_add(1, std::memory_order_relaxed);
-    const auto result = WalkGpuRing(rs, from, wptrOff,
-        [rb](uint32_t offset) { return GRead32(g_base, rb + offset); },
-        [rb](const GpuRingPacket& packet)
+    auto readWord = [rb](uint32_t offset) { return GRead32(g_base, rb + offset); };
+    auto execute = [rb](const GpuRingPacket& packet)
         {
             if (!packet.Wraps())
             {
@@ -3229,16 +3241,39 @@ static void ConsumeRing()
             std::memcpy(g_base + staging + packet.firstBytes, g_base + rb,
                         packet.size - packet.firstBytes);
             ExecPacketStream(staging, packet.size, 0);
-        });
+        };
+    auto result = WalkGpuRing(rs, from, wptrOff, readWord, execute);
+    // r27: a packet that does not fit what was published is (almost always) words not yet visible to this thread.
+    // Read them again for up to ~60 ms; the packets before it already ran, so continue from where the walk stopped.
+    for (int tries = 0; result.status != GpuRingStatus::Complete && tries < 60; ++tries)
+    {
+        if (result.status == GpuRingStatus::IncompletePacket) g_ringRptr.store(result.offset);
+        const uint32_t at = result.status == GpuRingStatus::IncompletePacket ? result.offset : g_ringRptr.load();
+        if (tries) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        else std::this_thread::yield();
+        uint32_t w2;
+        if (!ReadPublishedWptr(rb, rs, w2)) continue;
+        wptrOff = w2;
+        result = WalkGpuRing(rs, at, wptrOff, readWord, execute);
+        if (result.status == GpuRingStatus::Complete)
+        {
+            const uint32_t n = g_pm4Retried.fetch_add(1) + 1;
+            if (n <= 20 || (n % 100) == 0)
+                std::fprintf(stderr, "[pm4] ring packet became readable after %d re-read(s) (%u times so far)\n", tries + 1, n);
+        }
+    }
     if (result.status != GpuRingStatus::Complete)
     {
+        // Still no valid packet: report it once and carry on from the game's published end (a packet boundary)
+        // instead of stopping the game. At worst one frame's commands are lost.
+        const uint32_t n = g_pm4Resynced.fetch_add(1) + 1;
         std::fprintf(stderr,
-            "[pm4-fault] invalid published ring packet @%08X h=%08X required=%u available=%u ring=%08X+%X rptr=%X wptr=%X\n",
+            "[pm4-fault] invalid published ring packet @%08X h=%08X required=%u available=%u ring=%08X+%X rptr=%X wptr=%X"
+            " - skipped to the published end (%u time(s))\n",
             rb + result.offset, result.header, result.required, result.remaining,
-            rb, rs, g_ringRptr.load(), wptrOff);
+            rb, rs, g_ringRptr.load(), wptrOff, n);
         std::fflush(stderr);
-        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
-        std::abort();
+        result.offset = wptrOff;
     }
     g_ringRptr.store(result.offset);
     LowLatencyRingRead(from, result.offset, rs);        // low_latency.cpp: a drawn list's last command reached?

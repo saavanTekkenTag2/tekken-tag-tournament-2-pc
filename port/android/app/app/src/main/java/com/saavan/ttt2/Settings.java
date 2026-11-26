@@ -104,6 +104,8 @@ final class Settings {
             new String[] { "", "native" }, new String[] { "D3D11 (DXVK)", "NATIVE VULKAN (TEST)" }));
         ALL.add(env(P, "Native: background pipelines", "Native Vulkan only: new effects on screens already showing are prepared in the "
             + "background (no stutter; the effect may appear a frame late).", "TTT2_NATIVE_ASYNC", "1", ONOFF_V, ONOFF_L));
+        ALL.add(env(P, "Native: pipeline threads", "Threads the native renderer uses to build new effects in the background (more = effects appear sooner at match start).",
+            "TTT2_NATIVE_PIPELINE_THREADS", "3", new String[] { "1", "2", "3", "4" }, new String[] { "1", "2", "3", "4" }));
         ALL.add(env(P, "Lazy readbacks", "Effects that copy the picture back each frame use the previous frame's copy instead of waiting for "
             + "the GPU (smoother menus). OFF if an effect looks a frame late.", "TTT2_LAZY_READBACK", "1", ONOFF_V, ONOFF_L));
         ALL.add(env(P, "Render scale", "Overrides Resolution: the game drawn at this fraction of 720p. AUTO follows Resolution.", "TTT2_RENDER_SCALE", "",

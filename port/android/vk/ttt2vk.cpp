@@ -129,6 +129,12 @@ struct Core
     VkPhysicalDeviceFeatures enabled{};
     bool maintenance1 = false;
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    // r27: GPU timestamps (D3D11 TIMESTAMP queries): the game's frame timer reports the GPU's time per frame.
+    VkQueryPool tsPool = VK_NULL_HANDLE;
+    uint64_t tsMask = ~0ull;
+    double tsPeriodNs = 1.0;
+    std::mutex tsMutex;
+    std::vector<int> tsFree;
     std::mutex queueMutex;          // vkQueueSubmit / present / one-off submissions
 
     // Submissions: ids grow by one per vkQueueSubmit of the context. `next` is the id the open command buffer
@@ -617,9 +623,11 @@ struct InputLayout : Child<Stub_ID3D11InputLayout<ID3D11InputLayout>>
 struct Query : Child<Stub_ID3D11Query<ID3D11Query>>
 {
     D3D11_QUERY_DESC desc{};
-    uint64_t at = 0;            // EVENT: the submission that must finish
+    uint64_t at = 0;            // EVENT: the submission that must finish; TIMESTAMP: the one that wrote it
     bool ended = false;
+    int slot = -1;              // r27: TIMESTAMP: its query in the device's timestamp pool
     explicit Query(Device* d) : Child(d) {}
+    ~Query() override;
     void* Find(REFIID riid) override
     {
         if (Same(riid, __uuidof(ID3D11Query)) || Same(riid, __uuidof(ID3D11Asynchronous)) || Same(riid, __uuidof(ID3D11DeviceChild))) return static_cast<ID3D11Query*>(this);
@@ -740,6 +748,18 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
     HRESULT STDMETHODCALLTYPE CreateQuery(const D3D11_QUERY_DESC* desc, ID3D11Query** out) override
     {
         if (!out) return S_FALSE;
+        if (desc->Query == D3D11_QUERY_TIMESTAMP)
+        {
+            std::lock_guard l(core.tsMutex);
+            if (!core.tsPool || core.tsFree.empty()) return E_FAIL;
+            auto* q = new Query(this);
+            q->desc = *desc;
+            q->slot = core.tsFree.back();
+            core.tsFree.pop_back();
+            *out = q;
+            return S_OK;
+        }
+        if (desc->Query == D3D11_QUERY_TIMESTAMP_DISJOINT && !core.tsPool) return E_FAIL;
         auto* q = new Query(this);
         q->desc = *desc;
         *out = q;
@@ -782,6 +802,12 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
 
 template <class Base> Child<Base>::Child(Device* d) : device(d) { d->AddRef(); }
 template <class Base> Child<Base>::~Child() { device->Release(); }
+Query::~Query()
+{
+    if (slot < 0) return;
+    std::lock_guard l(device->core.tsMutex);
+    device->core.tsFree.push_back(slot);
+}
 template <class Base> void STDMETHODCALLTYPE Child<Base>::GetDevice(ID3D11Device** out) { *out = AddRefd(static_cast<ID3D11Device*>(device)); }
 
 // ---------------------------------------------------------------- destructors (deferred: the GPU may still use them)
@@ -1077,6 +1103,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         Cmd();
         FlushNewImages(false);
         vkEndCommandBuffer(cmd);
+        ++statSubmits;
         VkFence fence;
         if (freeFences.empty())
         {
@@ -1480,6 +1507,9 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         bi.clearValueCount = loadMask ? uint32_t(views.size()) : 0;
         bi.pClearValues = loadMask ? clears : nullptr;
         vkCmdBeginRenderPass(Cmd(), &bi, VK_SUBPASS_CONTENTS_INLINE);
+        ++statPasses;
+        for (int i = 0; i <= last; ++i) if (rtv[i]) { if (loadMask & (1u << i)) ++statClearLoads; else ++statColorLoads; }
+        if (d) { if (loadMask & 0x100) ++statClearLoads; else ++statDepthLoads; }
         inPass = true;
         passExtent = { w, h };
         boundPipeline = VK_NULL_HANDLE;
@@ -1534,6 +1564,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
     // threads for targets drawn into for 5+ frames in a row (a draw waits a frame or two then), at once otherwise
     // (render-to-texture bakes the CPU reads back must not lose a draw).
     uint64_t frameNo = 1, skippedDraws = 0, syncPipelines = 0, asyncPipelines = 0;
+    uint64_t statPasses = 0, statColorLoads = 0, statDepthLoads = 0, statClearLoads = 0, statSubmits = 0;   // r27
     VkRenderPass basePass = VK_NULL_HANDLE;           // the LOAD variant: framebuffers and pipelines use it
     bool passHot = false;                            // the current targets were drawn into in the last 5 frames
     std::unordered_map<PipeKey, std::shared_ptr<PipeEntry>, PipeKeyHash> pipelines;
@@ -2188,6 +2219,15 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
     void STDMETHODCALLTYPE End(ID3D11Asynchronous* a) override
     {
         Query* q = static_cast<Query*>(static_cast<ID3D11Query*>(a));
+        if (q->desc.Query == D3D11_QUERY_TIMESTAMP && q->slot >= 0 && core.tsPool)
+        {
+            // Reset outside a render pass (the frame timer's points are at present, between passes).
+            EndPass();
+            FlushClears();
+            vkCmdResetQueryPool(Cmd(), core.tsPool, uint32_t(q->slot), 1);
+            vkCmdWriteTimestamp(Cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, core.tsPool, uint32_t(q->slot));
+            ++commandsRecorded;
+        }
         q->at = core.next.load();
         q->ended = true;
     }
@@ -2207,8 +2247,21 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         }
         case D3D11_QUERY_TIMESTAMP_DISJOINT:
             if (data && size >= sizeof(D3D11_QUERY_DATA_TIMESTAMP_DISJOINT))
-                *static_cast<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT*>(data) = { 1000000000ull, TRUE };     // no GPU timing here
+                *static_cast<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT*>(data) =
+                    { core.tsPool ? uint64_t(1e9 / core.tsPeriodNs + 0.5) : 1000000000ull, core.tsPool ? FALSE : TRUE };
             return S_OK;
+        case D3D11_QUERY_TIMESTAMP:
+        {
+            if (!q->ended || q->slot < 0 || !core.tsPool) return S_FALSE;
+            if (q->at >= core.next.load() && !(flags & D3D11_ASYNC_GETDATA_DONOTFLUSH)) Submit();
+            Poll();
+            if (core.completed.load() < q->at) return S_FALSE;
+            uint64_t v = 0;
+            if (vkGetQueryPoolResults(core.dev, core.tsPool, uint32_t(q->slot), 1, sizeof(v), &v, sizeof(v), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+                return S_FALSE;
+            if (data && size >= sizeof(UINT64)) *static_cast<UINT64*>(data) = v & core.tsMask;
+            return S_OK;
+        }
         default:
             if (data && size) std::memset(data, 0, size);
             return S_OK;
@@ -2320,6 +2373,20 @@ bool Device::Init()
     r = vkCreateDevice(core.phys, &dci, nullptr, &core.dev);
     if (r != VK_SUCCESS) { Log("vkCreateDevice failed (%d)", int(r)); return false; }
     vkGetDeviceQueue(core.dev, core.family, 0, &core.queue);
+    if (qf[core.family].timestampValidBits && core.props.limits.timestampPeriod > 0.0f && !std::getenv("TTT2_NATIVE_NO_TIMESTAMPS"))
+    {
+        VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 64;
+        if (vkCreateQueryPool(core.dev, &qi, nullptr, &core.tsPool) == VK_SUCCESS)
+        {
+            const uint32_t bits = qf[core.family].timestampValidBits;
+            core.tsMask = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
+            core.tsPeriodNs = core.props.limits.timestampPeriod;
+            for (int i = 63; i >= 0; --i) core.tsFree.push_back(i);
+        }
+        else core.tsPool = VK_NULL_HANDLE;
+    }
     // r26: the pipeline cache from the last run (TTT2Recomp/native_pipelines.bin): pipelines built before are
     // not built again (the first second of a match spent 347 ms in vkCreateGraphicsPipelines, r25 log).
     std::vector<char> cacheData;
@@ -2378,7 +2445,8 @@ void* Device::Find(REFIID riid)
 void Device::StartWorkers()
 {
     const char* e = std::getenv("TTT2_NATIVE_PIPELINE_THREADS");
-    const int n = e && std::atoi(e) > 0 ? std::min(std::atoi(e), 4) : 2;
+    // r27: 3 by default (r26 log: 2 threads left 17263 draws waiting for pipelines in the first seconds of a match).
+    const int n = e && std::atoi(e) > 0 ? std::min(std::atoi(e), 4) : 3;
     for (int i = 0; i < n; ++i)
         std::thread([this] {
             setpriority(PRIO_PROCESS, 0, 5);
@@ -2415,11 +2483,14 @@ void Device::SavePipelineCache(bool wait)
         {
             const bool ok = std::fwrite(data.data(), 1, n, f) == n;
             std::fclose(f);
-            if (ok) std::rename(tmp.c_str(), cachePath.c_str());
+            if (ok && std::rename(tmp.c_str(), cachePath.c_str()) == 0) Log("pipeline cache saved: %zu KB", n / 1024);
+            else Log("pipeline cache NOT saved (%s)", cachePath.c_str());
         }
+        else Log("pipeline cache NOT saved: cannot write %s", tmp.c_str());
     };
-    if (wait) save();
-    else std::thread(save).detach();
+    static std::mutex saveMutex;     // r27: one save at a time (two used to write the same .tmp)
+    if (wait) { std::lock_guard l(saveMutex); save(); }
+    else std::thread([save] { std::lock_guard l(saveMutex); save(); }).detach();
 }
 
 void Device::OneOff(const std::function<void(VkCommandBuffer)>& record)
@@ -3341,7 +3412,11 @@ struct SwapChain : Com<Stub_IDXGISwapChain1<IDXGISwapChain1>>
             if (ctx->skippedDraws || ctx->asyncPipelines || ctx->syncPipelines)
                 Log("last 300 frames: %llu pipelines built at once, %llu in the background, %llu draws waited for one",
                     (unsigned long long)ctx->syncPipelines, (unsigned long long)ctx->asyncPipelines, (unsigned long long)ctx->skippedDraws);
+            Log("per frame: %.1f render passes (attachments loaded: %.1f colour, %.1f depth; %.1f cleared at load), %.1f submits",
+                ctx->statPasses / 300.0, ctx->statColorLoads / 300.0, ctx->statDepthLoads / 300.0, ctx->statClearLoads / 300.0,
+                ctx->statSubmits / 300.0);
             ctx->skippedDraws = ctx->asyncPipelines = ctx->syncPipelines = 0;
+            ctx->statPasses = ctx->statColorLoads = ctx->statDepthLoads = ctx->statClearLoads = ctx->statSubmits = 0;
             device->SavePipelineCache(false);
         }
         frames.push_back(device->core.next.load() - 1);
