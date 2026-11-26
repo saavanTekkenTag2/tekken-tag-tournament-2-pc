@@ -19,6 +19,7 @@
 #include <vulkan/vulkan.h>
 #include <SDL.h>
 #include <SDL_vulkan.h>
+#include <SDL_syswm.h>
 #include <vkd3d_shader.h>
 
 #include <algorithm>
@@ -1291,6 +1292,9 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         add(&rd, sizeof(rd));
         add(&dd, sizeof(dd));
         add(&sampleMask, sizeof(sampleMask));
+        const char* fce = std::getenv("DXVK_ANDROID_FORCE_DEPTH_CLIP");
+        const char fc = fce ? fce[0] : '-';
+        add(&fc, 1);
         if (l) for (auto& a : l->attrs) add(&vb[a.slot].stride, sizeof(UINT));
         auto it = pipelines.find(key);
         if (it != pipelines.end()) return it->second;
@@ -1337,7 +1341,16 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
         vp.viewportCount = vp.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-        rs.depthClampEnable = (!rd.DepthClipEnable && core.enabled.depthClamp) ? VK_TRUE : VK_FALSE;
+        // r25: Adreno drops primitives drawn with depth clamp (self-test 7a / 13 on an Adreno 810: nothing drawn, and the
+        // following tests too). Depth clip stays on, as the DXVK path does, unless DXVK_ANDROID_FORCE_DEPTH_CLIP=0.
+        const char* fe = std::getenv("DXVK_ANDROID_FORCE_DEPTH_CLIP");
+#ifdef __ANDROID__
+        const bool forceClip = !(fe && fe[0] == '0');
+#else
+        const bool forceClip = fe && fe[0] == '1';
+#endif
+        const bool clip = rd.DepthClipEnable || (forceClip && !std::getenv("TTT2_NATIVE_DEPTH_CLAMP"));
+        rs.depthClampEnable = (!clip && core.enabled.depthClamp) ? VK_TRUE : VK_FALSE;
         rs.polygonMode = (rd.FillMode == D3D11_FILL_WIREFRAME && core.enabled.fillModeNonSolid) ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         rs.cullMode = rd.CullMode == D3D11_CULL_FRONT ? VK_CULL_MODE_FRONT_BIT : rd.CullMode == D3D11_CULL_BACK ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
         // The viewport is flipped (negative height), so D3D's winding names hold as they are.
@@ -2791,7 +2804,18 @@ struct SwapChain : Com<Stub_IDXGISwapChain1<IDXGISwapChain1>>
         Core& c = device->core;
         if (!surface)
         {
-            if (!window || SDL_Vulkan_CreateSurface(window, c.inst, &surface) != SDL_TRUE)
+            bool haveWindow = window != nullptr;
+#if defined(__ANDROID__) && defined(SDL_VIDEO_DRIVER_ANDROID)
+            // r25: the game's window has no ANativeWindow while the app is in the background; a surface made then
+            // crashed inside the Vulkan loader (r24 crash.txt: SIGSEGV at 0x98 in libvulkan.so after SURFACE_LOST).
+            if (haveWindow)
+            {
+                SDL_SysWMinfo wm;
+                SDL_VERSION(&wm.version);
+                haveWindow = SDL_GetWindowWMInfo(window, &wm) && wm.info.android.window != nullptr;
+            }
+#endif
+            if (!haveWindow || SDL_Vulkan_CreateSurface(window, c.inst, &surface) != SDL_TRUE)
             {
                 surface = VK_NULL_HANDLE;
                 if (!warnedNoWindow) { Log("no window surface for now (%s) - presents skipped", SDL_GetError()); warnedNoWindow = true; }
@@ -2913,7 +2937,10 @@ struct SwapChain : Com<Stub_IDXGISwapChain1<IDXGISwapChain1>>
             std::lock_guard l(c.queueMutex);
             r = vkQueuePresentKHR(c.queue, &pi);
         }
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_SURFACE_LOST_KHR)
+        // r25: SUBOPTIMAL is fine - a phone in landscape answers it at every present (its surface is rotated 90 degrees
+        // from the display's natural portrait and the compositor rotates). r24 rebuilt the swap chain at each one:
+        // 6384 rebuilds in one session, ~27 ms a present, 30 fps (MEASURED 2026-11-26, Adreno 810).
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR)
         {
             vkQueueWaitIdle(c.queue);
             DestroySwapchain();
