@@ -164,7 +164,17 @@ struct Core
         a.allocationSize = r.size;
         a.memoryTypeIndex = uint32_t(type);
         VkDeviceMemory m = VK_NULL_HANDLE;
-        if (vkAllocateMemory(dev, &a, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+        const VkResult vr = vkAllocateMemory(dev, &a, nullptr, &m);
+        if (vr != VK_SUCCESS)
+        {
+            // r30: textures that cannot get memory are missing in the game: say so (phones with little RAM).
+            static std::atomic<int> failures{ 0 };
+            const int n = ++failures;
+            if (n <= 20 || n % 200 == 0)
+                std::fprintf(stderr, "[native-vk] out of GPU memory: %.1f MB could not be allocated (error %d, %d time(s))\n",
+                             double(r.size) / 1048576.0, int(vr), n);
+            return VK_NULL_HANDLE;
+        }
         return m;
     }
     void Defer(std::function<void()> f)
@@ -2551,6 +2561,7 @@ bool Device::Init()
         VK_VERSION_PATCH(core.props.apiVersion), core.props.driverVersion, sup.textureCompressionBC ? "" : " (no BC textures!)",
         sup.depthClamp ? "" : " (no depth clamp)");
     // r29: what this GPU cannot do with the formats the game uses, so a phone's log shows why something is missing.
+    if (std::getenv("TTT2_GFX_COMPAT")) Log("Graphics fix: on (safest path: full barriers, waited uploads, decoded BC, no texture memo)");
     if (g_decodeBC) Log("BC textures are decoded on upload (BC1 -> A1R5G5B5, BC2/BC3 -> RGBA8, BC4 -> R8, BC5 -> RG8)");
     if (g_d24AsD32) Log("D24S8 is not a depth format here: D32S8 is used instead");
     {

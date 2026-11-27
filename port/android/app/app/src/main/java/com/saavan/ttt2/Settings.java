@@ -70,6 +70,8 @@ final class Settings {
             "Display", "AntiAliasing", "0", range(0, 3), new String[] { "OFF", "SMAA", "SSAA 1.5X", "SSAA 2X" }));
         ALL.add(ini(D, "Sharpness", "Contrast adaptive sharpening of the scaled picture (helps lower resolutions).",
             "Display", "Sharpness", "0", range(0, 10), rangeLabels(0, 10, "OFF")));
+        ALL.add(pref(D, "Graphics fix", "Turn ON if textures look wrong, are missing or clothes look white on your phone. "
+            + "It uses the safest graphics path: a little slower.", "gfx_compat", "0", ONOFF_V, ONOFF_L));
         ALL.add(ini(D, "Texture filtering", "Standard is the console's look. Anisotropic is sharper at an angle, a little slower.",
             "Display", "TextureFiltering", "0", range(0, 5), new String[] { "STANDARD", "TRILINEAR", "ANISO 2X", "ANISO 4X", "ANISO 8X", "ANISO 16X" }));
         ALL.add(ini(D, "VSync", "ON: no tearing. OFF: a little less input lag, the picture may tear.",
@@ -180,7 +182,7 @@ final class Settings {
      * shows every setting again for testing.
      */
     static final Set<String> BASIC = new HashSet<>(Arrays.asList(
-            "Resolution", "VSync", "Brightness", "FpsCounter", "Sharpness", "Shadows", "DepthOfField", "Bloom", "LightShafts", "Weather",
+            "Resolution", "gfx_compat", "VSync", "Brightness", "FpsCounter", "Sharpness", "Shadows", "DepthOfField", "Bloom", "LightShafts", "Weather",
             "QuickStart", "InputDelay",
             "Netcode", "CustomDelay", "CustomRollback", "RematchMenu",
             "touch", "full_screen", "touch_alpha", "touch_size",
@@ -347,6 +349,14 @@ final class Settings {
             String v = locked(c, o) ? o.def : p.getString("env_" + o.key, o.def);
             if (v == null || v.isEmpty()) continue;
             a.add("--set"); a.add(o.key + "=" + v);
+        }
+        // r30: Graphics fix - every speed shortcut with a correctness risk off (on top of the locked values).
+        if ("1".equals(p.getString("gfx_compat", "0"))) {
+            for (String kv : new String[] { "TTT2_TEX_MEMO=0", "TTT2_FAST_UNTILE=0", "TTT2_LAZY_READBACK=0", "TTT2_NATIVE_FULL_BARRIERS=1",
+                                            "TTT2_NATIVE_ONEOFF_WAIT=1", "TTT2_NATIVE_DECODE_BC=1", "TTT2_NATIVE_NO_SPV_CACHE=1",
+                                            "TTT2_NATIVE_ASYNC=0", "TTT2_GFX_COMPAT=1" }) {
+                a.add("--set"); a.add(kv);
+            }
         }
         if (!devUnlocked(c)) return a;      // custom variables only with the developer unlock
         for (String line : p.getString("env_custom", "").split("\n")) {

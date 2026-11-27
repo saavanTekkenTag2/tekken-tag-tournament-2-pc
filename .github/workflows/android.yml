@@ -1,0 +1,274 @@
+# TTT2 Android APK on GitHub Actions (free on this public repository's standard runners).
+#
+# The game files (your Default.xex + Title Update 3) are NOT in this repository: they are downloaded at build time
+# from the release "gamefiles" of your PRIVATE repository (secret PRIVATE_REPO, e.g. saavanTekkenTag2/ttt2-private),
+# with the token in secret PRIVATE_TOKEN. Nothing made from them (the recompiled C++, its objects, the build logs) is
+# cached, printed or uploaded here; the signed APK and any failure logs go to the private repository's releases.
+#
+# Secrets (set once by ttt2-actions-setup.sh): PRIVATE_REPO, PRIVATE_TOKEN, KEYSTORE_B64, KEYSTORE_PASSWORD, KEY_ALIAS.
+# Run: Actions tab -> "Android APK" -> Run workflow (or: gh workflow run android.yml --ref android).
+name: Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      NDK_VER: "29.0.14206865"
+      D: /mnt/deps
+      B: /mnt/build/android
+      DB: /mnt/build/dxvk-android
+      OUT: /mnt/out
+      LOGS: /mnt/logs
+    steps:
+      - name: Check the secrets
+        env:
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          for v in PRIVATE_REPO PRIVATE_TOKEN KEYSTORE_B64; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is not set - run ttt2-actions-setup.sh in Termux"; exit 1; }
+          done
+
+      - name: More disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules /usr/share/swift \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p /mnt/deps /mnt/build /mnt/out /mnt/logs && sudo chown -R "$USER" /mnt/deps /mnt/build /mnt/out /mnt/logs
+          df -h / /mnt | tail -2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang lld cmake ninja-build python3-pip glslang-tools bison flex unzip >/dev/null
+          pip install -q --break-system-packages pillow pycryptodome meson
+          clang --version | head -1; cmake --version | head -1; meson --version
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK + NDK
+        run: |
+          SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VER" > "$LOGS/sdkmanager.log" 2>&1 || { tail -20 "$LOGS/sdkmanager.log"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          echo "TC=$ANDROID_HOME/ndk/$NDK_VER/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+      - name: Game files from the private repository
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          mkdir -p /tmp/gf re Updates
+          gh release download gamefiles -R "$PRIVATE_REPO" -D /tmp/gf -p 'Default.xex' -p 'TU_*' > /dev/null
+          echo "a942090b7c293d0ce63346ed8a2974448135d0dd  /tmp/gf/Default.xex" | sha1sum -c --quiet || { echo "::error::Default.xex is not the USA/Europe 0.0.0.2 disc's"; exit 1; }
+          mv /tmp/gf/Default.xex re/Default.xex
+          mv /tmp/gf/TU_* Updates/
+          ls -la re/Default.xex Updates/ | sed 's/.*  *//' >/dev/null
+          echo "game files: OK"
+
+      - name: XenonRecomp (cached; built from the public recompiler + this repo's patch)
+        id: xrcache
+        uses: actions/cache@v4
+        with:
+          path: tools/XenonRecomp
+          key: xenonrecomp-ddd128b-${{ hashFiles('tools/patches/XenonRecomp.patch') }}-v1
+
+      - name: Build XenonRecomp
+        if: steps.xrcache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf tools/XenonRecomp
+          git clone -q --recursive https://github.com/hedge-dev/XenonRecomp tools/XenonRecomp
+          git -C tools/XenonRecomp checkout -q ddd128b
+          git -C tools/XenonRecomp submodule update --init --recursive -q
+          git -C tools/XenonRecomp apply --whitespace=nowarn "$GITHUB_WORKSPACE/tools/patches/XenonRecomp.patch"
+          cmake -S tools/XenonRecomp -B tools/XenonRecomp/build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Release > "$LOGS/xr-cfg.log" 2>&1 || { tail -30 "$LOGS/xr-cfg.log"; exit 1; }
+          ninja -C tools/XenonRecomp/build > "$LOGS/xr-build.log" 2>&1 || { grep -m30 'error' "$LOGS/xr-build.log"; exit 1; }
+
+      - name: Generate the game code (kept private - no output from the game here)
+        run: |
+          R=$GITHUB_WORKSPACE
+          # the repo's Windows-path tools, with their D:\Projects\... paths pointed at this checkout
+          cat > /tmp/runwin.py <<'PY'
+          import re, sys, os
+          root = sys.argv[1]; script = sys.argv[2]
+          src = open(script, encoding="utf-8").read()
+          pat = re.compile(r'"D:\\Projects\\Tekken Tag Tournament 2 \(USA, Europe\)([^"]*)"')
+          src = pat.sub(lambda m: repr(root + m.group(1).replace("\\", "/")), src)
+          sys.argv = [script] + sys.argv[3:]
+          sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+          exec(compile(src, script, "exec"), {"__name__": "__main__", "__file__": os.path.abspath(script)})
+          PY
+          runwin() { python3 /tmp/runwin.py "$R" "$@" >> "$LOGS/gen.log" 2>&1; }
+          XR=$R/tools/XenonRecomp/build/XenonRecomp/XenonRecomp
+          CTX=$R/tools/XenonRecomp/XenonUtils/ppc_context.h
+          fail() { echo "::error::$1 (details in the private repository's build-logs release)"; exit 1; }
+          recomp() { mkdir -p re/ppc; (cd re/recomp && "$XR" tekken.toml "$CTX") >> "$LOGS/gen.log" 2>&1 || fail "recompiler"; }
+          errs() { grep -ho '// ERROR [0-9A-F]\{8\}' re/ppc/ppc_recomp.*.cpp 2>/dev/null | sort -u | wc -l || true; }
+          runwin port/tools/stfs.py || fail "title update extraction"
+          recomp
+          runwin port/tools/xex_unpack.py "$R/re/recomp/Default_patched_tu3.xex" || fail "image unpack"
+          python3 port/tools/gen_missing_switches.py >> "$LOGS/gen.log" 2>&1 || fail "switch tables"
+          recomp
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            n=$(errs); echo "pass $i: $n unresolved"
+            [ "$n" = 0 ] && break
+            python3 port/tools/gen_missing_functions.py >> "$LOGS/gen.log" 2>&1 || fail "missing functions"
+            recomp
+          done
+          [ "$(errs)" = 0 ] || fail "unresolved sites remain"
+          python3 port/tools/debug_probes.py >> "$LOGS/gen.log" 2>&1 || fail "generated-code patches"
+          python3 port/tools/check_recomp_acceptance.py >> "$LOGS/gen.log" 2>&1 || fail "acceptance check"
+          runwin port/tools/gen_kernel_stubs.py || fail "kernel stubs"
+          python3 port/android/ppc/fix_ppc_context_arm64.py re/ppc/ppc_context.h tools/XenonRecomp/XenonUtils/ppc_context.h >> "$LOGS/gen.log" 2>&1 || fail "ARM64 context fix"
+          echo "generated: $(ls re/ppc/*.cpp | wc -l) files"
+          rm -f re/Default.xex re/recomp/Default_patched_tu3.xex; rm -rf Updates re/extracted_tu re/decrypted
+
+      - name: Dependencies (SDL2 2.30.9, dxvk-native 1.9.2b, FFmpeg n7.1, Wine 10.20's vkd3d)
+        run: |
+          git clone -q --depth 1 -b release-2.30.9 https://github.com/libsdl-org/SDL.git "$D/SDL2"
+          git clone -q --depth 1 -b native-1.9.2b https://github.com/Joshua-Ashton/dxvk-native.git "$D/dxvk-native"
+          git clone -q --depth 1 -b n7.1 https://github.com/FFmpeg/FFmpeg.git "$D/FFmpeg"
+          git clone -q --depth 1 --filter=blob:none --sparse -b wine-10.20 https://github.com/wine-mirror/wine.git "$D/wine"
+          git -C "$D/wine" sparse-checkout set --no-cone /libs/vkd3d/
+          FB=$D/ffmpeg-android-build; mkdir -p "$FB"; cd "$FB"
+          bash "$D/FFmpeg/configure" --enable-cross-compile --target-os=android --arch=aarch64 --cpu=armv8-a \
+            --cc="$TC/aarch64-linux-android29-clang" --cxx="$TC/aarch64-linux-android29-clang++" \
+            --ar="$TC/llvm-ar" --ranlib="$TC/llvm-ranlib" --nm="$TC/llvm-nm" --strip="$TC/llvm-strip" \
+            --disable-everything --disable-programs --disable-doc --disable-avdevice --disable-avformat \
+            --disable-swresample --disable-swscale --disable-postproc --disable-avfilter --disable-network \
+            --disable-asm --disable-debug --disable-autodetect --enable-decoder=wmapro,xma1,xma2 \
+            --enable-parser=xma --enable-pic > "$LOGS/ffmpeg-configure.log" 2>&1 || { tail -30 "$LOGS/ffmpeg-configure.log"; exit 1; }
+
+      - name: Configure + SDL2
+        run: |
+          cmake -S port/android -B "$B" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DCMAKE_BUILD_TYPE=Release \
+            -DFFMPEG_SRC="$D/FFmpeg" -DFFMPEG_BUILD="$D/ffmpeg-android-build" -DSDL2_SOURCE="$D/SDL2" \
+            -DDXVK_NATIVE_SOURCE="$D/dxvk-native" -DVKD3D_SOURCE="$D/wine/libs/vkd3d" \
+            -DTTT2_D3D_LIBS="$DB/src/d3d11/libdxvk_d3d11.so;$DB/src/dxgi/libdxvk_dxgi.so" \
+            > "$LOGS/cmake.log" 2>&1 || { tail -30 "$LOGS/cmake.log"; exit 1; }
+          ninja -C "$B" SDL2 > "$LOGS/sdl2.log" 2>&1 || { grep -m30 'error' "$LOGS/sdl2.log"; exit 1; }
+
+      - name: DXVK-native for Android
+        run: |
+          python3 port/android/dxvk/patch_dxvk_android.py "$D/dxvk-native"
+          SDLDIR=$(dirname "$(find "$B/sdl2" -maxdepth 1 -name 'libSDL2*.so' | sed -n 1p)")
+          INC="'-I$B/sdl2/include-config-release/SDL2', '-I$B/sdl2/include/SDL2', '-I$B/sdl2/include', '-I$B/sdl2/include-config-release', '-I$GITHUB_WORKSPACE/port/android/dxvk/compat', '-I$GITHUB_WORKSPACE/tools/XenonRecomp/thirdparty/simde'"
+          cat > /mnt/build/android-ndk-cross.txt <<EOF
+          [binaries]
+          c = '$TC/aarch64-linux-android29-clang'
+          cpp = '$TC/aarch64-linux-android29-clang++'
+          ar = '$TC/llvm-ar'
+          strip = '$TC/llvm-strip'
+          [built-in options]
+          c_args = [$INC, '-fPIC']
+          cpp_args = [$INC, '-fPIC', '-Wno-everything']
+          c_link_args = ['-L$SDLDIR', '-Wl,-z,max-page-size=16384']
+          cpp_link_args = ['-L$SDLDIR', '-static-libstdc++', '-Wl,-z,max-page-size=16384']
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'armv8-a'
+          endian = 'little'
+          EOF
+          sed -i 's/^          //' /mnt/build/android-ndk-cross.txt
+          meson setup "$DB" "$D/dxvk-native" --cross-file /mnt/build/android-ndk-cross.txt --buildtype=release -Db_ndebug=true \
+            -Ddxvk_native_force=true -Denable_d3d9=false -Denable_d3d10=false > "$LOGS/meson.log" 2>&1 || { tail -30 "$LOGS/meson.log"; exit 1; }
+          ninja -C "$DB" > "$LOGS/dxvk.log" 2>&1 || { grep -m30 'error' "$LOGS/dxvk.log"; exit 1; }
+          ls -la "$DB/src/d3d11/libdxvk_d3d11.so" "$DB/src/dxgi/libdxvk_dxgi.so"
+
+      - name: Build libmain.so (the long part)
+        run: |
+          set +e
+          ninja -C "$B" -j"$(nproc)" -k 0 main > "$LOGS/main.log" 2>&1 &
+          P=$!
+          while kill -0 $P 2>/dev/null; do sleep 120; echo "  $(date +%H:%M) $(grep -o '^\[[0-9]*/[0-9]*\]' "$LOGS/main.log" | tail -1)"; done
+          wait $P; RC=$?
+          set -e
+          if [ $RC -ne 0 ]; then
+            # file names and error messages only (no source lines from the generated code)
+            grep -E 'error:|undefined symbol' "$LOGS/main.log" | grep -v '/re/ppc/' | cut -c1-240 | sort -u | head -40
+            echo "::error::libmain.so failed to build (full log in the private repository's build-logs release)"
+            exit 1
+          fi
+
+      - name: jniLibs
+        run: |
+          J=$OUT/jniLibs/arm64-v8a; mkdir -p "$J"
+          SDLSO=$(find "$B/sdl2" -maxdepth 1 -name 'libSDL2*.so' | sed -n 1p)
+          "$TC/llvm-strip" --strip-unneeded -o "$J/libmain.so" "$B/libmain.so"
+          "$TC/llvm-strip" --strip-unneeded -o "$J/libSDL2.so" "$SDLSO"
+          "$TC/llvm-strip" --strip-unneeded -o "$J/libdxvk_d3d11.so" "$DB/src/d3d11/libdxvk_d3d11.so"
+          "$TC/llvm-strip" --strip-unneeded -o "$J/libdxvk_dxgi.so" "$DB/src/dxgi/libdxvk_dxgi.so"
+          for so in "$J"/*.so; do
+            for n in $("$TC/llvm-readelf" -d "$so" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+              case "$n" in libmain.so|libSDL2.so|libdxvk_d3d11.so|libdxvk_dxgi.so|libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libaaudio.so|libvulkan.so|libGLESv1_CM.so|libGLESv2.so|libOpenSLES.so|libEGL.so) ;;
+                *) echo "::error::$(basename "$so") needs $n, which an Android phone does not have"; exit 1;;
+              esac
+            done
+          done
+          ls -la "$J"
+
+      - name: Signed APK
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > /tmp/ttt2-release.jks
+          curl -sSfL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q /tmp/gradle.zip -d "$D"
+          cd port/android/app
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          VC=$(git -C "$GITHUB_WORKSPACE" rev-list --count HEAD)
+          "$D/gradle-8.9/bin/gradle" --no-daemon -q assembleRelease \
+            -Pttt2.jniLibs="$OUT/jniLibs" -Pttt2.sdlJava="$D/SDL2/android-project/app/src/main/java" -Pttt2.versionCode="$VC" \
+            -Pttt2.keystore=/tmp/ttt2-release.jks -Pttt2.storePassword="$KEYSTORE_PASSWORD" -Pttt2.keyAlias="$KEY_ALIAS" \
+            -Pttt2.keyPassword="$KEYSTORE_PASSWORD" > "$LOGS/gradle.log" 2>&1 || { grep -E 'error|FAILED|What went wrong' -A3 "$LOGS/gradle.log" | head -40; exit 1; }
+          rm -f /tmp/ttt2-release.jks
+          VN=$(sed -n "s/.*findProperty('ttt2.versionName') ?: '\([0-9.]*\)'.*/\1/p" app/build.gradle)
+          cp app/build/outputs/apk/release/app-release.apk "$OUT/TTT2-Android-v$VN.apk"
+          echo "VN=$VN" >> "$GITHUB_ENV"
+          ls -la "$OUT"/*.apk
+
+      - name: APK to the private repository (release v<version>)
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          T="v$VN"
+          gh release view "$T" -R "$PRIVATE_REPO" >/dev/null 2>&1 || gh release create "$T" -R "$PRIVATE_REPO" --title "TTT2 Android $T" --notes "Built by GitHub Actions ($GITHUB_SHA)." >/dev/null
+          gh release upload "$T" -R "$PRIVATE_REPO" "$OUT/TTT2-Android-$T.apk" --clobber
+          echo "APK: release $T of the private repository"
+
+      - name: Failure logs to the private repository
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+        run: |
+          [ -n "$PRIVATE_REPO" ] || exit 0
+          cd /mnt && tar -czf /tmp/build-logs.tar.gz logs 2>/dev/null || exit 0
+          gh release view build-logs -R "$PRIVATE_REPO" >/dev/null 2>&1 || gh release create build-logs -R "$PRIVATE_REPO" --title "Build logs" --notes "Logs of the last failed build." >/dev/null
+          gh release upload build-logs -R "$PRIVATE_REPO" /tmp/build-logs.tar.gz --clobber

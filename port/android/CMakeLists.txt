@@ -47,6 +47,7 @@ add_library(ttt2_setup_core STATIC
     "${PORT}/src/setup/xdvdfs.cpp"
     "${PORT}/src/setup/stfs.cpp"
     "${PORT}/src/setup/game_data.cpp"
+    "${PORT}/src/setup/dlc_install.cpp"
     "${XENON_UTILS}/xex_patcher.cpp"
     "${XENON_UTILS}/memory_mapped_file.cpp"
     "${XENON_THIRDPARTY}/libmspack/libmspack/mspack/lzxd.c"
@@ -63,7 +64,7 @@ target_include_directories(ttt2_setup_core PUBLIC "${PORT}/src" PRIVATE
 target_compile_definitions(ttt2_setup_core PRIVATE NOMINMAX)
 target_compile_options(ttt2_setup_core PRIVATE -O2 -Wno-everything)
 set_source_files_properties("${PORT}/src/setup/xdvdfs.cpp" "${PORT}/src/setup/stfs.cpp" "${PORT}/src/setup/game_data.cpp"
-    "${XENON_UTILS}/xex_patcher.cpp" "${XENON_UTILS}/memory_mapped_file.cpp"
+    "${PORT}/src/setup/dlc_install.cpp" "${XENON_UTILS}/xex_patcher.cpp" "${XENON_UTILS}/memory_mapped_file.cpp"
     TARGET_DIRECTORY ttt2_setup_core PROPERTIES COMPILE_OPTIONS "-include;msvc_crt.h")
 
 # 4) Win32 layer

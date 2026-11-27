@@ -16,7 +16,7 @@ android {
         versionCode buildNumber
         // r28: the release version shown in the app and compared with volvisionmods.com's latest version.
         // Raise it for every release (1.0.1 -> 1.0.2 ...); versionCode keeps counting commits.
-        versionName project.findProperty('ttt2.versionName') ?: '1.0.2'
+        versionName project.findProperty('ttt2.versionName') ?: '1.0.3'
         ndk { abiFilters 'arm64-v8a' }
     }
     sourceSets {
@@ -31,9 +31,25 @@ android {
             keepDebugSymbols += ['**/*.so']       // already stripped by the build script
         }
     }
+    // r31: release builds (GitHub Actions) are signed with the project's own key, passed as properties:
+    //   -Pttt2.keystore=<file.jks> -Pttt2.storePassword=.. -Pttt2.keyAlias=.. -Pttt2.keyPassword=..
+    // Without them a release build falls back to the debug key.
+    def releaseKey = project.findProperty('ttt2.keystore')
+    signingConfigs {
+        release {
+            if (releaseKey) {
+                storeFile file(releaseKey)
+                storePassword project.findProperty('ttt2.storePassword')
+                keyAlias project.findProperty('ttt2.keyAlias')
+                keyPassword project.findProperty('ttt2.keyPassword')
+                enableV1Signing true
+                enableV2Signing true
+            }
+        }
+    }
     buildTypes {
         debug { minifyEnabled false }
-        release { minifyEnabled false; signingConfig signingConfigs.debug }
+        release { minifyEnabled false; signingConfig releaseKey ? signingConfigs.release : signingConfigs.debug }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

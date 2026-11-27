@@ -67,7 +67,7 @@ import java.util.zip.ZipOutputStream;
  * Game folder, saves and logs: Android/data/com.saavan.ttt2/files.
  */
 public class LauncherActivity extends Activity {
-    private static final int PICK_ISO = 1, PICK_TU = 2;
+    private static final int PICK_ISO = 1, PICK_TU = 2, PICK_FOLDER = 3, PICK_DLC_DIR = 4, PICK_DLC_FILES = 5;
 
     // The game's colours: Tekken red, steel / silver, smoke violet, ink black.
     static final int RED = Color.rgb(226, 22, 34), RED_DARK = Color.rgb(120, 8, 16), SILVER = Color.rgb(222, 224, 232),
@@ -350,7 +350,7 @@ public class LauncherActivity extends Activity {
         LinearLayout menu = new LinearLayout(this);
         menu.setOrientation(LinearLayout.VERTICAL);
         playItem = new MenuItem("PLAY", this::play);
-        isoItem = new MenuItem("SELECT ISO", () -> pick(PICK_ISO));
+        isoItem = new MenuItem("SELECT GAME", this::chooseGameSource);
         tuItem = new MenuItem("SELECT TITLE UPDATE", () -> pick(PICK_TU));
         MenuItem options = new MenuItem("OPTIONS", () -> showPage(buildOptions()));
         MenuItem updates = new MenuItem("CHECK FOR UPDATES", () -> VolvisionUpdateChannel.checkNow(this, VolvisionUpdateChannel.versionName(this)));
@@ -801,9 +801,11 @@ public class LauncherActivity extends Activity {
 
     private void fillTools(LinearLayout list) {
         list.addView(note("Game folder, saves and logs: " + dataRoot(this) + "\nSaves: TTT2Recomp/saves   Log: TTT2Recomp/log.txt"));
-        list.addView(actionRow(installed() ? "REINSTALL GAME" : "INSTALL GAME", "Builds the game folder again from the chosen ISO and Title Update.", this::startInstall), llp(-1, -2, 6));
+        list.addView(actionRow(installed() ? "REINSTALL GAME" : "INSTALL GAME", "Builds the game folder again from the chosen ISO or game folder and Title Update.", this::startInstall), llp(-1, -2, 6));
         list.addView(actionRow(shadersBuilt(this) ? "BUILD SHADERS (DONE - CHECK FOR NEW)" : "BUILD SHADERS",
             "Prepares every graphics shader now (one time, 10-40 minutes) so matches start without missing stages or characters.", this::startShaderBuild), llp(-1, -2, 6));
+        list.addView(actionRow("ADD DLC", "Your own DLC packages (Bonus Tracks, Bonus Movies...). Installed now: " + dlcCount() + ".", this::chooseDlc), llp(-1, -2, 6));
+        if (dlcCount() > 0) list.addView(actionRow("REMOVE DLC", "Takes the added DLC out of the game.", this::removeDlc), llp(-1, -2, 6));
         list.addView(actionRow("EDIT TOUCH CONTROLS", "Move, resize and fade each on-screen button.", () -> startActivity(new Intent(this, ControlsEditorActivity.class))), llp(-1, -2, 6));
         list.addView(actionRow("SAVE LOGS", "Saves the logs as a zip in Download/TTT2 Logs on your phone, to send with a problem report.", this::exportDebug), llp(-1, -2, 6));
         list.addView(actionRow("CHECK FOR UPDATES", "Asks volvisionmods.com for a newer version.",
@@ -1014,15 +1016,16 @@ public class LauncherActivity extends Activity {
     private void refresh() {
         if (playItem == null) return;
         boolean ok = installed();
-        String iso = prefs.getString("iso", null), tu = prefs.getString("tu", null);
-        isoItem.setSub(iso == null ? "NOT CHOSEN" : nameOf(iso, ""));
-        tuItem.setSub(tu == null ? "NOT CHOSEN" : nameOf(tu, ""));
-        playItem.setSub(installing ? "PLEASE WAIT..." : ok ? (shadersBuilt(this) ? "READY" : "READY - SHADERS NOT BUILT YET (OPTIONS > TOOLS)") : iso != null && tu != null ? "TAP TO INSTALL" : "SELECT ISO AND TITLE UPDATE FIRST");
+        String iso = prefs.getString("iso", null), tu = prefs.getString("tu", null), folder = prefs.getString("folder", null);
+        isoItem.setSub(folder != null ? "FOLDER: " + folderName(folder) : iso == null ? "ISO OR GAME FOLDER - NOT CHOSEN" : nameOf(iso, ""));
+        tuItem.setSub(tu == null ? (folder != null ? "NOT NEEDED FOR AN INSTALLED FOLDER" : "NOT CHOSEN") : nameOf(tu, ""));
+        final boolean ready = folder != null || (iso != null && tu != null);
+        playItem.setSub(installing ? "PLEASE WAIT..." : ok ? (shadersBuilt(this) ? "READY" : "READY - SHADERS NOT BUILT YET (OPTIONS > TOOLS)") : ready ? "TAP TO INSTALL" : "SELECT GAME AND TITLE UPDATE FIRST");
         playItem.setAlpha(installing ? 0.5f : 1f);
         isoItem.setEnabled(!installing);
         tuItem.setEnabled(!installing);
         if (!installing && status.getText().length() == 0)
-            status.setText(ok ? "Game installed." : "Choose your disc image and Title Update 3 (about 10 GB free space needed).");
+            status.setText(ok ? "Game installed." : "Choose your disc image (or extracted game folder) and Title Update 3 (about 10 GB free space needed).");
     }
 
     private String nameOf(String uri, String fallback) {
@@ -1042,19 +1045,69 @@ public class LauncherActivity extends Activity {
         startActivityForResult(i, code);
     }
 
+    // r30: the game from a disc image or from a folder (extracted from the disc, or an installed game folder).
+    private void chooseGameSource() {
+        if (installing) return;
+        new AlertDialog.Builder(this).setTitle("Select your game")
+            .setItems(new String[] { "Disc image (.iso)", "Extracted game folder" }, (d, which) -> {
+                if (which == 0) pick(PICK_ISO);
+                else {
+                    new AlertDialog.Builder(this).setTitle("Extracted game folder")
+                        .setMessage("Choose the folder that holds default.xex, nrfo.bin and the data000-041.bin files (extracted from your disc), "
+                            + "or an installed game folder with tekken.img and the update folder.\n\nIf Title Update 3 is not inside the folder, "
+                            + "select it with SELECT TITLE UPDATE.")
+                        .setPositiveButton("Choose folder", (d2, w2) -> pickTree(PICK_FOLDER)).setNegativeButton("Cancel", null).show();
+                }
+            }).show();
+    }
+
+    private void pickTree(int code) {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(i, code);
+    }
+
+    private String folderName(String treeUri) {
+        try {
+            String id = android.provider.DocumentsContract.getTreeDocumentId(Uri.parse(treeUri));
+            int c = id.indexOf(':');
+            String path = c >= 0 ? id.substring(c + 1) : id;
+            return path.isEmpty() ? "/" : path;
+        } catch (Exception e) { return "chosen"; }
+    }
+
+    /** A tree's direct children: {name, document uri, mime}. */
+    private List<String[]> children(Uri tree, String parentDocId) {
+        List<String[]> out = new ArrayList<>();
+        Uri kids = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentDocId);
+        try (Cursor c = getContentResolver().query(kids, new String[] {
+                android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE }, null, null, null)) {
+            while (c != null && c.moveToNext())
+                out.add(new String[] { c.getString(1), android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0)).toString(),
+                                       c.getString(2), c.getString(0) });
+        } catch (Exception ignored) {}
+        return out;
+    }
+
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (result != RESULT_OK || data == null || data.getData() == null) return;
+        if (result != RESULT_OK || data == null) return;
+        if (request == PICK_DLC_FILES || request == PICK_DLC_DIR) { addDlc(request, data); return; }
+        if (data.getData() == null) return;
         Uri uri = data.getData();
         try { getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); } catch (Exception ignored) {}
-        prefs.edit().putString(request == PICK_ISO ? "iso" : "tu", uri.toString()).apply();
+        if (request == PICK_FOLDER) prefs.edit().putString("folder", uri.toString()).remove("iso").apply();
+        else if (request == PICK_ISO) prefs.edit().putString("iso", uri.toString()).remove("folder").apply();
+        else prefs.edit().putString("tu", uri.toString()).apply();
         status.setText("");
         refresh();
-        // Both chosen and nothing installed yet: offer the install straight away.
-        if (!installed() && prefs.getString("iso", null) != null && prefs.getString("tu", null) != null)
+        // Ready and nothing installed yet: offer the install straight away.
+        if (!installed() && (prefs.getString("folder", null) != null || (prefs.getString("iso", null) != null && prefs.getString("tu", null) != null)))
             new AlertDialog.Builder(this).setTitle("Install the game?")
-                .setMessage("Builds the game folder from your disc image and Title Update 3 (about 10 GB free space, several minutes).")
+                .setMessage("Builds the game folder from your game files and Title Update 3 (about 10 GB free space, several minutes).")
                 .setPositiveButton("Install", (d, w) -> startInstall()).setNegativeButton("Later", null).show();
     }
 
@@ -1108,8 +1161,9 @@ public class LauncherActivity extends Activity {
 
     private void startInstall() {
         if (installing) return;
-        if (prefs.getString("iso", null) == null || prefs.getString("tu", null) == null) {
-            toastStatus("Select your ISO and Title Update first.");
+        final String folder = prefs.getString("folder", null);
+        if (folder == null && (prefs.getString("iso", null) == null || prefs.getString("tu", null) == null)) {
+            toastStatus("Select your game (ISO or folder) and Title Update first.");
             return;
         }
         installing = true;
@@ -1121,6 +1175,7 @@ public class LauncherActivity extends Activity {
         installBar.setProgress(0);
         showInstallPanel(true);
         refresh();
+        if (folder != null) { new Thread(() -> installFromFolder(Uri.parse(folder)), "ttt2-install").start(); return; }
         new Thread(() -> {
             String error;
             try (ParcelFileDescriptor iso = getContentResolver().openFileDescriptor(Uri.parse(prefs.getString("iso", "")), "r");
@@ -1145,6 +1200,165 @@ public class LauncherActivity extends Activity {
                 if (err == null) startShaderBuild();
             });
         }, "ttt2-install").start();
+    }
+
+    /** r30: the folder's files (and its update/ folder) opened and handed to Native.installFolder. Worker thread. */
+    private void installFromFolder(Uri tree) {
+        String error;
+        List<ParcelFileDescriptor> open = new ArrayList<>();
+        try {
+            String root = android.provider.DocumentsContract.getTreeDocumentId(tree);
+            List<String> names = new ArrayList<>(), paths = new ArrayList<>();
+            for (String[] k : children(tree, root)) {
+                if (android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(k[2])) {
+                    if (!k[0].equalsIgnoreCase("update")) continue;
+                    for (String[] u : children(tree, k[3])) {
+                        if (android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(u[2])) continue;
+                        ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(Uri.parse(u[1]), "r");
+                        if (pfd == null) continue;
+                        open.add(pfd); names.add("update/" + u[0]); paths.add("/proc/self/fd/" + pfd.getFd());
+                    }
+                    continue;
+                }
+                ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(Uri.parse(k[1]), "r");
+                if (pfd == null) continue;
+                open.add(pfd); names.add(k[0]); paths.add("/proc/self/fd/" + pfd.getFd());
+            }
+            if (names.isEmpty()) throw new Exception("The folder is empty or could not be read.");
+            ParcelFileDescriptor tu = null;
+            String tuUri = prefs.getString("tu", null);
+            if (tuUri != null) { tu = getContentResolver().openFileDescriptor(Uri.parse(tuUri), "r"); if (tu != null) open.add(tu); }
+            error = Native.installFolder(names.toArray(new String[0]), paths.toArray(new String[0]), tu != null ? "/proc/self/fd/" + tu.getFd() : "",
+                dataRoot(this), new Native.Listener() {
+                    @Override public void progress(int percent, String text) {
+                        runOnUiThread(() -> { installBar.setProgress(percent); installText.setText(text); });
+                    }
+                    @Override public boolean cancelled() { return cancel; }
+                });
+        } catch (Throwable t) {
+            error = t.getMessage() != null ? t.getMessage() : t.toString();
+        } finally {
+            for (ParcelFileDescriptor p : open) try { p.close(); } catch (Exception ignored) {}
+        }
+        final String err = error;
+        runOnUiThread(() -> {
+            installing = false;
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            showInstallPanel(false);
+            status.setText(err == null ? "Installed. Press PLAY." : "Install failed: " + err);
+            refresh();
+            if (err == null) startShaderBuild();
+        });
+    }
+
+    // ================================================================ DLC (r30)
+    private int dlcCount() {
+        File[] f = new File(dataRoot(this), "game/dlc").listFiles((d, n) -> n.endsWith(".ttt2-dlc"));
+        return f == null ? 0 : f.length;
+    }
+
+    private void chooseDlc() {
+        if (installing) return;
+        if (!installed()) { toastStatus("Install the game first."); return; }
+        new AlertDialog.Builder(this).setTitle("Add DLC")
+            .setMessage("Adds your own Tekken Tag Tournament 2 DLC (Xbox 360 content packages, e.g. the Bonus Tracks and Bonus Movies packs). "
+                + "Choose the package files, or a folder that holds them.")
+            .setPositiveButton("Choose files", (d, w) -> {
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("*/*");
+                i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                startActivityForResult(i, PICK_DLC_FILES);
+            })
+            .setNeutralButton("Choose folder", (d, w) -> pickTree(PICK_DLC_DIR))
+            .setNegativeButton("Cancel", null).show();
+    }
+
+    /** The chosen packages copied to a temporary folder (names kept), checked and extracted by Native.installDlc. */
+    private void addDlc(int request, Intent data) {
+        final List<String[]> picked = new ArrayList<>();       // {name, uri}
+        if (request == PICK_DLC_FILES) {
+            ClipData cd = data.getClipData();
+            if (cd != null) for (int i = 0; i < cd.getItemCount(); i++) picked.add(new String[] { nameOf(cd.getItemAt(i).getUri().toString(), "dlc" + i), cd.getItemAt(i).getUri().toString() });
+            else if (data.getData() != null) picked.add(new String[] { nameOf(data.getData().toString(), "dlc"), data.getData().toString() });
+        } else if (data.getData() != null) {
+            Uri tree = data.getData();
+            collectDlc(tree, android.provider.DocumentsContract.getTreeDocumentId(tree), "", 0, picked);
+        }
+        if (picked.isEmpty()) { toastStatus("No files chosen."); return; }
+        installing = true;
+        cancel = false;
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        installTitle.setText("ADDING DLC");
+        installText.setText("Copying...");
+        installBar.setProgress(0);
+        showInstallPanel(true);
+        new Thread(() -> {
+            String msg;
+            File tmp = new File(dataRoot(this), "tmp/dlc_in");
+            deleteTree(tmp);
+            try {
+                if (!tmp.mkdirs() && !tmp.isDirectory()) throw new Exception("Could not create a temporary folder.");
+                byte[] buf = new byte[1 << 20];
+                for (int i = 0; i < picked.size() && !cancel; i++) {
+                    final int n = i;
+                    runOnUiThread(() -> { installText.setText("Copying " + picked.get(n)[0] + "..."); installBar.setProgress(n * 30 / picked.size()); });
+                    File out = new File(tmp, picked.get(i)[0].replaceAll("[\\\\/:*?\"<>|]", "_"));
+                    if (out.getParentFile() != null) out.getParentFile().mkdirs();
+                    try (InputStream in = getContentResolver().openInputStream(Uri.parse(picked.get(i)[1]));
+                         OutputStream os = new java.io.FileOutputStream(out)) {
+                        if (in == null) continue;
+                        int r;
+                        while ((r = in.read(buf)) > 0 && !cancel) os.write(buf, 0, r);
+                    }
+                }
+                if (cancel) throw new Exception("Cancelled.");
+                String r = Native.installDlc(tmp.getAbsolutePath(), dataRoot(this), new Native.Listener() {
+                    @Override public void progress(int percent, String text) {
+                        runOnUiThread(() -> { installBar.setProgress(30 + percent * 70 / 100); installText.setText(text); });
+                    }
+                    @Override public boolean cancelled() { return cancel; }
+                });
+                msg = r != null && r.startsWith("OK:") ? r.substring(3) + " DLC package(s) added. They are in the game now." : "DLC not added: " + r;
+            } catch (Throwable t) {
+                msg = "DLC not added: " + (t.getMessage() != null ? t.getMessage() : t.toString());
+            } finally {
+                deleteTree(tmp);
+            }
+            final String m = msg;
+            runOnUiThread(() -> {
+                installing = false;
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                showInstallPanel(false);
+                new AlertDialog.Builder(this).setTitle("DLC").setMessage(m).setPositiveButton("OK", null).show();
+                refresh();
+            });
+        }, "ttt2-dlc").start();
+    }
+
+    /** Files under a chosen DLC folder (3 levels), each under 2 GB, with their folder path kept in the name. */
+    private void collectDlc(Uri tree, String docId, String prefix, int depth, List<String[]> out) {
+        if (depth > 3 || out.size() > 200) return;
+        for (String[] k : children(tree, docId)) {
+            if (android.provider.DocumentsContract.Document.MIME_TYPE_DIR.equals(k[2])) collectDlc(tree, k[3], prefix + k[0] + "/", depth + 1, out);
+            else out.add(new String[] { prefix + k[0], k[1] });
+        }
+    }
+
+    private static void deleteTree(File f) {
+        if (f == null || !f.exists()) return;
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteTree(k);
+        f.delete();
+    }
+
+    private void removeDlc() {
+        if (installing) return;
+        int n = dlcCount();
+        if (n == 0) { toastStatus("No DLC installed."); return; }
+        new AlertDialog.Builder(this).setTitle("Remove DLC").setMessage("Removes the " + n + " DLC package(s) from the game (your own package files are not touched).")
+            .setPositiveButton("Remove", (d, w) -> { deleteTree(new File(dataRoot(this), "game/dlc")); toastStatus("DLC removed."); })
+            .setNegativeButton("Cancel", null).show();
     }
 
     // ================================================================ shaders (r23)
