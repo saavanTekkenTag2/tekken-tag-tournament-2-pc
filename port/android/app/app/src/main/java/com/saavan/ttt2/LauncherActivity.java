@@ -1573,6 +1573,21 @@ public class LauncherActivity extends Activity {
                     z.closeEntry();
                     zipDir(z, new File(dataRoot(this), "TTT2Recomp"), "TTT2Recomp/", 40_000_000L);
                     zipDir(z, new File(dataRoot(this), "ttt2/port"), "ttt2/port/", 40_000_000L);
+                    // r33: the system log of this app (the game's process included): it still holds a crash that
+                    // happened before the game could write its own log (library load, driver, a Java error).
+                    z.putNextEntry(new ZipEntry("logcat.txt"));
+                    try {
+                        Process lp = new ProcessBuilder("logcat", "-d", "-v", "threadtime", "-b", "main,system,crash", "-t", "30000")
+                            .redirectErrorStream(true).start();
+                        try (InputStream in = lp.getInputStream()) {
+                            byte[] lb = new byte[65536]; int r; long total = 0;
+                            while ((r = in.read(lb)) > 0 && total < 30_000_000L) { z.write(lb, 0, r); total += r; }
+                        }
+                        lp.waitFor();
+                    } catch (Throwable t) {
+                        z.write(("logcat failed: " + t).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                    z.closeEntry();
                 }
                 ContentValues done = new ContentValues();
                 done.put(MediaStore.Downloads.IS_PENDING, 0);

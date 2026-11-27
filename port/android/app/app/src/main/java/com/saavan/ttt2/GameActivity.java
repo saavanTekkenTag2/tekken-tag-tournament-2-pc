@@ -29,6 +29,16 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // r33: a Java error in the game's process is written to TTT2Recomp/java_crash.txt (SAVE LOGS takes it).
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        final java.io.File jc = new java.io.File(LauncherActivity.dataRoot(this), "TTT2Recomp/java_crash.txt");
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try (java.io.PrintWriter w = new java.io.PrintWriter(new java.io.FileWriter(jc, true))) {
+                w.println("===== " + new java.util.Date() + "  thread " + t.getName());
+                e.printStackTrace(w);
+            } catch (Throwable ignored) {}
+            if (prev != null) prev.uncaughtException(t, e);
+        });
         LauncherActivity.useFullScreen(this);     // r23: the picture under the camera cut-out too
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
