@@ -694,10 +694,14 @@ void AfterKickWait(uint32_t fence)
 // The kick's device (diag_hooks.cpp sub_82738DA0 from the kick): for the fence test.
 void NoteDevice(uint32_t device) { g_device.store(device, std::memory_order_release); }
 // Command processor threads (kernel_video.cpp): never wait in the guard.
+#ifdef __ANDROID__
+extern "C" void Ttt2EnsureAltStack(void);   // win32_memory.cpp
+#endif
 void MarkCpThread()
 {
     t_cpThread = true;
 #ifdef __ANDROID__
+    Ttt2EnsureAltStack();              // r32: the CP thread faults into readbacks too
     ttt2_affinity::GameThread();       // r22: the command processor on the big cores
 #endif
 }

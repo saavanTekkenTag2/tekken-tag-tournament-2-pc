@@ -11,6 +11,7 @@
 // file picker. Output: <root>/game/...
 #include <windows.h>
 #include <jni.h>
+#include <dirent.h>
 
 #include <algorithm>
 #include <atomic>
@@ -504,6 +505,34 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_saavan_ttt2_Native_installFolder(J
     return env->NewStringUTF(job.error.empty() ? "Installation failed." : job.error.c_str());
 }
 
+// r32: what the folder holds instead of game DLC: bit 0 avatar items (content type 0x9000), bit 1 other packages.
+static int OtherPackages(const std::string& dir, int depth = 0)
+{
+    int kinds = 0;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return 0;
+    while (dirent* e = readdir(d))
+    {
+        const std::string name = e->d_name;
+        if (name == "." || name == "..") continue;
+        const std::string path = dir + "/" + name;
+        struct stat st{};
+        if (stat(path.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) { if (depth < 4) kinds |= OtherPackages(path, depth + 1); continue; }
+        if (!S_ISREG(st.st_mode) || st.st_size < 0x400) continue;
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) continue;
+        unsigned char magic[4] = {}, type[4] = {};
+        const bool read = std::fread(magic, 1, 4, f) == 4 && std::fseek(f, 0x344, SEEK_SET) == 0 && std::fread(type, 1, 4, f) == 4;
+        std::fclose(f);
+        if (!read || !(std::memcmp(magic, "LIVE", 4) == 0 || std::memcmp(magic, "PIRS", 4) == 0 || std::memcmp(magic, "CON ", 4) == 0)) continue;
+        const uint32_t t = uint32_t(type[0]) << 24 | uint32_t(type[1]) << 16 | uint32_t(type[2]) << 8 | type[3];
+        kinds |= t == 0x00009000 ? 1 : t != 0x00000002 ? 2 : 0;
+    }
+    closedir(d);
+    return kinds;
+}
+
 // r30: Java: static native String installDlc(String folder, String root, Listener l)
 // The player's downloadable content packages (Bonus Tracks / Bonus Movies, content type 2) found in `folder` are checked
 // against their own hashes and extracted to <root>/game/dlc, where the game lists them. Returns "OK:<n>" or the error.
@@ -517,8 +546,19 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_saavan_ttt2_Native_installDlc(JNIE
     int damaged = 0;
     const std::vector<DlcPackage> found = FindDlc(W(dir), &damaged);
     if (found.empty())
-        return env->NewStringUTF(damaged ? "The DLC files found there are damaged or incomplete."
-                                         : "No Tekken Tag Tournament 2 DLC was found there (only the game's own DLC packages can be added).");
+    {
+        if (damaged) return env->NewStringUTF("The DLC files found there are damaged or incomplete.");
+        const int kinds = OtherPackages(dir);
+        if (kinds & 1)
+            return env->NewStringUTF("Those files are Xbox 360 avatar items (folder 00009000), not game DLC. They are clothes for "
+                                     "the Xbox dashboard avatar and do nothing in the game itself, so they can't be added. "
+                                     "Game DLC is in a folder named 00000002 (Bonus Tracks / Bonus Movies).");
+        if (kinds & 2)
+            return env->NewStringUTF("Those files are Xbox 360 packages of another kind (not game DLC). Only the game's own DLC, "
+                                     "in a folder named 00000002, can be added.");
+        return env->NewStringUTF("No Tekken Tag Tournament 2 DLC was found there. Choose the folder that holds the DLC "
+                                 "packages (usually .../4E4D0859/00000002).");
+    }
     uint64_t total = 0, done = 0;
     for (const DlcPackage& p : found) total += p.bytes;
     struct statvfs vs{};

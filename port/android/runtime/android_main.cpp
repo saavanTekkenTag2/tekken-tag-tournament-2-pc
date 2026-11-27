@@ -31,6 +31,7 @@
 
 int ttt2_main(int argc, char** argv);                       // main.cpp
 extern "C" void Ttt2InstallSignalHandlers(void);            // win32_memory.cpp
+extern "C" void Ttt2EnsureAltStack(void);                   // win32_memory.cpp
 extern "C" void Ttt2SetCommandLine(int argc, char** argv);  // win32_core.cpp
 extern "C" void Ttt2GpuSelfTest(const char* root);           // gpu_selftest_android.cpp
 
@@ -121,9 +122,7 @@ static void InstallCrashReport(const std::string& root)
 {
     std::snprintf(g_crashPath, sizeof g_crashPath, "%s/TTT2Recomp/crash.txt", root.c_str());
     unlink(g_crashPath);
-    static char altStack[64 * 1024];
-    stack_t ss{}; ss.ss_sp = altStack; ss.ss_size = sizeof altStack;
-    sigaltstack(&ss, nullptr);
+    Ttt2EnsureAltStack();      // r32: 1 MiB (was 64 KiB) - the fault handler's readbacks run on it
     for (int sig : { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT })
     {
         struct sigaction sa{};

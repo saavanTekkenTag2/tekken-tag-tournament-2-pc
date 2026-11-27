@@ -425,11 +425,15 @@ static Thread* ThreadOf(HANDLE h)
 }
 extern "C" DWORD GetThreadId(HANDLE h) { Thread* t = ThreadOf(h); return t ? DWORD(t->tid) : 0; }
 
+extern "C" void Ttt2EnsureAltStack(void);   // win32_memory.cpp
+extern "C" void Ttt2ReleaseAltStack(void);
+
 static void* ThreadMain(void* arg)
 {
     auto* t = static_cast<Thread*>(arg);
     t->tid = CurrentTid();
     t_self = t;
+    Ttt2EnsureAltStack();                       // r32: room for a readback in the fault handler
     {
         std::lock_guard lk(g_threadsMutex);
         Threads()[t->tid] = t;
@@ -455,6 +459,7 @@ static void* ThreadMain(void* arg)
     t->cv.notify_all();
     t_self = nullptr;
     Release(t);                                 // the thread's own reference
+    Ttt2ReleaseAltStack();
     return nullptr;
 }
 
@@ -510,6 +515,7 @@ extern "C" [[noreturn]] void ExitThread(DWORD code)
         { std::lock_guard lk(t->m); t->exitCode = code; t->done = true; }
         t->cv.notify_all();
     }
+    Ttt2ReleaseAltStack();
     pthread_exit(nullptr);
 }
 extern "C" HANDLE OpenThread(DWORD, BOOL, DWORD id)

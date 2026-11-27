@@ -203,24 +203,30 @@ public class LauncherActivity extends Activity {
     final class MenuItem extends FrameLayout {
         final View glow;
         final TextView title, sub;
-        MenuItem(String label, Runnable action) {
+        MenuItem(String label, Runnable action) { this(label, action, 19, false); }
+        MenuItem(String label, Runnable action, float size, boolean centre) {
             super(LauncherActivity.this);
             setFocusable(true);
             setClickable(true);
-            setBackground(new Plate(dp(16), Color.argb(170, 12, 10, 18), RED));
+            final float slant = size >= 20 ? dp(16) : dp(11);
+            setBackground(new Plate(slant, Color.argb(185, 12, 10, 18), RED));
             glow = new View(getContext());
-            glow.setBackground(new Plate(dp(16), Color.argb(150, 160, 14, 26), Color.rgb(255, 70, 70)));
+            glow.setBackground(new Plate(slant, Color.argb(160, 160, 14, 26), Color.rgb(255, 70, 70)));
             glow.setAlpha(0f);
             addView(glow, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             LinearLayout col = new LinearLayout(getContext());
             col.setOrientation(LinearLayout.VERTICAL);
-            col.setGravity(Gravity.CENTER_VERTICAL);
-            col.setPadding(dp(34), 0, dp(22), 0);
-            title = text(label, 19, SILVER, bold);
+            col.setGravity(centre ? Gravity.CENTER : Gravity.CENTER_VERTICAL);
+            col.setPadding(centre ? dp(14) : dp(28), 0, centre ? dp(10) : dp(16), 0);
+            title = text(label, size, SILVER, bold);
             title.setLetterSpacing(0.06f);
+            title.setSingleLine(true);
             col.addView(title);
-            sub = text("", 10.5f, STEEL, regular);
-            sub.setLetterSpacing(0.04f);
+            sub = text("", Math.max(8.5f, size * 0.5f), STEEL, regular);
+            sub.setLetterSpacing(0.03f);
+            sub.setSingleLine(true);
+            sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            sub.setPadding(0, dp(2), 0, 0);
             sub.setVisibility(GONE);
             col.addView(sub);
             addView(col, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
@@ -239,9 +245,8 @@ public class LauncherActivity extends Activity {
             glow.animate().alpha(down || isFocused() ? 1f : 0f).setDuration(down ? 120 : 260).start();
         }
         void highlight(boolean on) {
-            if (noAnim()) { glow.setAlpha(on ? 1f : 0f); setTranslationX(on ? dp(10) : 0); return; }
+            if (noAnim()) { glow.setAlpha(on ? 1f : 0f); return; }
             glow.animate().alpha(on ? 1f : 0f).setDuration(220).start();
-            animate().translationX(on ? dp(10) : 0).setDuration(240).setInterpolator(new DecelerateInterpolator()).start();
         }
     }
 
@@ -344,80 +349,112 @@ public class LauncherActivity extends Activity {
 
     private static int withAlpha(int c, int a) { return Color.argb(a, Color.red(c), Color.green(c), Color.blue(c)); }
 
+    /**
+     * r32 home redesign. The art's logo has the top-left of the screen to itself; everything else is one compact block
+     * at the bottom left that never reaches up into it: a large PLAY plate, the two install choices side by side, three
+     * small plates (OPTIONS / UPDATES / CREDITS) and the status line. Sizes follow the screen's height, so nothing is
+     * clipped on short phones and the subtitles stay on one line. The author's card sits at the bottom right.
+     */
     private View buildHome() {
         FrameLayout f = new FrameLayout(this);
-        // The art's logo is in its top-left third; the menu sits under it.
-        LinearLayout menu = new LinearLayout(this);
-        menu.setOrientation(LinearLayout.VERTICAL);
-        playItem = new MenuItem("PLAY", this::play);
-        isoItem = new MenuItem("SELECT GAME", this::chooseGameSource);
-        tuItem = new MenuItem("SELECT TITLE UPDATE", () -> pick(PICK_TU));
-        MenuItem options = new MenuItem("OPTIONS", () -> showPage(buildOptions()));
-        MenuItem updates = new MenuItem("CHECK FOR UPDATES", () -> VolvisionUpdateChannel.checkNow(this, VolvisionUpdateChannel.versionName(this)));
-        MenuItem credits = new MenuItem("CREDITS", () -> showPage(buildCredits()));
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        final float hdp = Math.min(dm.heightPixels, dm.widthPixels) / dm.density;
+        // The block's natural height is about 214 dp; it may use the lower 60% of the screen.
+        final float k = Math.max(0.72f, Math.min(1f, hdp * 0.60f / 214f));
+        final int panelW = 352;
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+
+        playItem = new MenuItem("PLAY", this::play, 25 * k, false);
+        isoItem = new MenuItem("SELECT GAME", this::chooseGameSource, 15 * k, false);
+        tuItem = new MenuItem("TITLE UPDATE", () -> pick(PICK_TU), 15 * k, false);
+        MenuItem options = new MenuItem("OPTIONS", () -> showPage(buildOptions()), 13.5f * k, true);
+        MenuItem updates = new MenuItem("UPDATES", () -> VolvisionUpdateChannel.checkNow(this, VolvisionUpdateChannel.versionName(this)), 13.5f * k, true);
+        MenuItem credits = new MenuItem("CREDITS", () -> showPage(buildCredits()), 13.5f * k, true);
         menuItems.clear();
         menuItems.add(playItem); menuItems.add(isoItem); menuItems.add(tuItem); menuItems.add(options); menuItems.add(updates); menuItems.add(credits);
-        playItem.title.setTextSize(23);
-        // Six entries: a little shorter on short screens so the last one never runs under the footer.
-        final boolean shortScreen = getResources().getDisplayMetrics().heightPixels / getResources().getDisplayMetrics().density < 380;
-        for (int i = 0; i < menuItems.size(); i++)
-            menu.addView(menuItems.get(i), llp(dp(300), dp(i == 0 ? (shortScreen ? 40 : 44) : (shortScreen ? 32 : 37)), i == 0 ? 0 : (shortScreen ? 4 : 6)));
-        FrameLayout.LayoutParams mp = flp(-2, -2, Gravity.START | Gravity.BOTTOM);
-        mp.leftMargin = dp(26);
-        mp.bottomMargin = dp(40);
-        f.addView(menu, mp);
+        playItem.title.setLetterSpacing(0.14f);
 
-        // Footer: install status on the left, the port's author on the right.
-        LinearLayout foot = new LinearLayout(this);
-        foot.setOrientation(LinearLayout.VERTICAL);
-        status = text("", 11, STEEL, regular);
-        foot.addView(status);
+        panel.addView(playItem, llp(dp(panelW), dp(56 * k), 0));
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        row1.addView(isoItem, weighted(dp(50 * k), 0));
+        row1.addView(tuItem, weighted(dp(50 * k), 8));
+        panel.addView(row1, llp(dp(panelW), dp(50 * k), Math.round(8 * k)));
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.addView(options, weighted(dp(38 * k), 0));
+        row2.addView(updates, weighted(dp(38 * k), 8));
+        row2.addView(credits, weighted(dp(38 * k), 8));
+        panel.addView(row2, llp(dp(panelW), dp(38 * k), Math.round(8 * k)));
+
+        status = text("", 10.5f, STEEL, regular);
+        status.setMaxLines(2);
+        status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        status.setPadding(dp(4), 0, 0, 0);
+        panel.addView(status, llp(dp(panelW), -2, Math.round(9 * k)));
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(100);
         progress.setVisibility(View.GONE);
-        foot.addView(progress, llp(dp(300), dp(4), 3));
-        FrameLayout.LayoutParams fp = flp(-2, -2, Gravity.START | Gravity.BOTTOM);
-        fp.leftMargin = dp(30);
-        fp.bottomMargin = dp(14);
-        f.addView(foot, fp);
+        panel.addView(progress, llp(dp(panelW), dp(4), 4));
 
-        // r26: "PORTED BY CATONIX" with a pulsing play badge and an arrow - a tap opens the YouTube channel.
+        FrameLayout.LayoutParams mp = flp(-2, -2, Gravity.START | Gravity.BOTTOM);
+        mp.leftMargin = dp(24);
+        mp.bottomMargin = dp(14);
+        f.addView(panel, mp);
+
+        // The author's card: a rounded glass pill - play badge, PORTED BY / CATONIX, an arrow; the version under it.
         LinearLayout corner = new LinearLayout(this);
         corner.setOrientation(LinearLayout.VERTICAL);
         corner.setGravity(Gravity.END);
-        corner.setPadding(dp(10), dp(6), dp(6), dp(4));
-        TextView by = text("PORTED BY", 9.5f, STEEL, semi);
-        by.setLetterSpacing(0.25f);
-        corner.addView(by);
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        TextView name = text(Credits.PORT_BY, 16, SILVER, bold);
-        name.setLetterSpacing(0.08f);
-        row.addView(name);
+        LinearLayout pill = new LinearLayout(this);
+        pill.setOrientation(LinearLayout.HORIZONTAL);
+        pill.setGravity(Gravity.CENTER_VERTICAL);
+        GradientDrawable pg = new GradientDrawable();
+        pg.setCornerRadius(dp(26));
+        pg.setColor(Color.argb(190, 10, 9, 16));
+        pg.setStroke(dp(1), Color.argb(150, 226, 22, 34));
+        pill.setBackground(pg);
+        pill.setPadding(dp(8), dp(6), dp(14), dp(6));
         playBadge = new PlayBadge();
-        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(dp(26), dp(26));
-        bp.leftMargin = dp(8);
-        row.addView(playBadge, bp);
-        cornerArrow = text("\u203A", 22, Color.WHITE, bold);
-        cornerArrow.setPadding(dp(6), 0, 0, dp(2));
-        row.addView(cornerArrow);
-        corner.addView(row);
-        TextView yt = text("WATCH ON YOUTUBE", 8.5f, RED, semi);
-        yt.setLetterSpacing(0.2f);
-        corner.addView(yt);
-        cornerVersion = text(version(), 9f, STEEL, regular);
+        pill.addView(playBadge, new LinearLayout.LayoutParams(dp(34), dp(34)));
+        LinearLayout names = new LinearLayout(this);
+        names.setOrientation(LinearLayout.VERTICAL);
+        names.setPadding(dp(9), 0, dp(4), 0);
+        TextView by = text("PORTED BY", 8.5f, STEEL, semi);
+        by.setLetterSpacing(0.28f);
+        names.addView(by);
+        TextView name = text(Credits.PORT_BY, 17, Color.WHITE, bold);
+        name.setLetterSpacing(0.10f);
+        names.addView(name);
+        TextView yt = text("YOUTUBE", 8f, Color.rgb(255, 90, 90), semi);
+        yt.setLetterSpacing(0.3f);
+        names.addView(yt);
+        pill.addView(names);
+        cornerArrow = text("\u203A", 24, Color.WHITE, bold);
+        cornerArrow.setPadding(dp(2), 0, 0, dp(3));
+        pill.addView(cornerArrow);
+        corner.addView(pill);
+        cornerVersion = text(version(), 9.5f, STEEL, regular);
+        cornerVersion.setPadding(0, dp(5), dp(12), 0);
         corner.addView(cornerVersion);
-        corner.setFocusable(true);
-        corner.setClickable(true);
-        corner.setOnClickListener(v -> open(Credits.BUTTONS[0][1]));
-        tapFeedback(corner);
+        pill.setFocusable(true);
+        pill.setClickable(true);
+        pill.setOnClickListener(v -> open(Credits.BUTTONS[0][1]));
+        tapFeedback(pill);
         FrameLayout.LayoutParams cp = flp(-2, -2, Gravity.END | Gravity.BOTTOM);
-        cp.rightMargin = dp(24);
+        cp.rightMargin = dp(22);
         cp.bottomMargin = dp(14);
         f.addView(corner, cp);
         f.setTag(corner);
         return f;
+    }
+
+    private LinearLayout.LayoutParams weighted(int h, int left) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, h, 1f);
+        p.leftMargin = dp(left);
+        return p;
     }
 
     private String version() {
@@ -445,7 +482,7 @@ public class LauncherActivity extends Activity {
         View corner = (View) home.getTag();
         if (noAnim()) {
             bg.setAlpha(1f); bg.setScaleX(BG_ZOOM); bg.setScaleY(BG_ZOOM);
-            for (MenuItem m : menuItems) { m.setAlpha(1f); m.setTranslationX(0); }
+            for (MenuItem m : menuItems) { m.setAlpha(1f); m.setTranslationY(0); }
             corner.setAlpha(1f);
             playItem.requestFocus();
             return;
@@ -455,8 +492,8 @@ public class LauncherActivity extends Activity {
         for (int i = 0; i < menuItems.size(); i++) {
             MenuItem m = menuItems.get(i);
             m.setAlpha(0f);
-            m.setTranslationX(-dp(60));
-            m.animate().alpha(1f).translationX(0).setStartDelay(160 + i * 60L).setDuration(320).setInterpolator(new DecelerateInterpolator(1.6f)).start();
+            m.setTranslationY(dp(24));
+            m.animate().alpha(1f).translationY(0).setStartDelay(160 + i * 55L).setDuration(320).setInterpolator(new DecelerateInterpolator(1.6f)).start();
         }
         corner.setAlpha(0f);
         corner.animate().alpha(1f).setStartDelay(420).setDuration(300).start();
@@ -1017,10 +1054,10 @@ public class LauncherActivity extends Activity {
         if (playItem == null) return;
         boolean ok = installed();
         String iso = prefs.getString("iso", null), tu = prefs.getString("tu", null), folder = prefs.getString("folder", null);
-        isoItem.setSub(folder != null ? "FOLDER: " + folderName(folder) : iso == null ? "ISO OR GAME FOLDER - NOT CHOSEN" : nameOf(iso, ""));
-        tuItem.setSub(tu == null ? (folder != null ? "NOT NEEDED FOR AN INSTALLED FOLDER" : "NOT CHOSEN") : nameOf(tu, ""));
+        isoItem.setSub(folder != null ? "FOLDER: " + folderName(folder) : iso == null ? "ISO OR FOLDER" : nameOf(iso, ""));
+        tuItem.setSub(tu == null ? (folder != null ? "NOT NEEDED" : "NOT CHOSEN") : nameOf(tu, ""));
         final boolean ready = folder != null || (iso != null && tu != null);
-        playItem.setSub(installing ? "PLEASE WAIT..." : ok ? (shadersBuilt(this) ? "READY" : "READY - SHADERS NOT BUILT YET (OPTIONS > TOOLS)") : ready ? "TAP TO INSTALL" : "SELECT GAME AND TITLE UPDATE FIRST");
+        playItem.setSub(installing ? "PLEASE WAIT..." : ok ? (shadersBuilt(this) ? "READY TO FIGHT" : "READY  -  SHADERS: OPTIONS > TOOLS") : ready ? "TAP TO INSTALL" : "CHOOSE GAME + TITLE UPDATE FIRST");
         playItem.setAlpha(installing ? 0.5f : 1f);
         isoItem.setEnabled(!installing);
         tuItem.setEnabled(!installing);

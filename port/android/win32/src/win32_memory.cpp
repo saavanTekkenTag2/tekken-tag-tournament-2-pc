@@ -539,8 +539,8 @@ void Handler(int sig, siginfo_t* info, void* uctx)
 
 void Install()
 {
-    // Each thread that faults needs stack: an alternate stack for the main thread is enough to log
-    // a stack overflow there; others run on their own (large) stacks.
+    // Each thread that faults needs stack: Ttt2EnsureAltStack (below) gives every thread that can
+    // fault a 1 MiB alternate stack - bionic's own per-thread one is far too small for a readback.
     struct sigaction sa{};
     sa.sa_sigaction = Handler;
     sigemptyset(&sa.sa_mask);
@@ -553,6 +553,35 @@ void Install()
 } // namespace
 
 extern "C" void Ttt2InstallSignalHandlers(void) { std::call_once(g_installOnce, Install); }
+
+// r32: a large signal stack for every thread that can fault into the handler. bionic gives each
+// pthread only a small one (16-32 KiB), and SA_ONSTACK puts the handler there: a lazy readback in
+// the handler runs the GPU driver (vkQueueSubmit / vkWaitForFences / memcpy), which needs far more
+// - on Mali that overflowed at match start (SIGSEGV in libGLES_mali on a guest thread). One mapping
+// per thread, never freed while the thread lives (the kernel needs it until the thread exits).
+namespace { constexpr size_t kAltSize = 1024 * 1024, kAltGuard = 64 * 1024; thread_local void* t_altStack = nullptr; thread_local stack_t t_oldAlt{}; }
+extern "C" void Ttt2EnsureAltStack(void)
+{
+    if (t_altStack) return;
+    void* p = mmap(nullptr, kAltSize + kAltGuard, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (p == MAP_FAILED) return;
+    mprotect(p, kAltGuard, PROT_NONE);           // stacks grow down: a guard below
+    stack_t ss{};
+    ss.ss_sp = static_cast<char*>(p) + kAltGuard;
+    ss.ss_size = kAltSize;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, &t_oldAlt) != 0) { munmap(p, kAltSize + kAltGuard); return; }
+    t_altStack = p;
+}
+// A thread that ends hands bionic its own signal stack back (bionic frees that one itself) and unmaps ours.
+extern "C" void Ttt2ReleaseAltStack(void)
+{
+    if (!t_altStack) return;
+    if (t_oldAlt.ss_sp && !(t_oldAlt.ss_flags & SS_DISABLE)) sigaltstack(&t_oldAlt, nullptr);
+    else { stack_t off{}; off.ss_flags = SS_DISABLE; sigaltstack(&off, nullptr); }
+    munmap(t_altStack, kAltSize + kAltGuard);
+    t_altStack = nullptr;
+}
 
 extern "C" PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER handler)
 {

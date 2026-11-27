@@ -510,6 +510,10 @@ struct Srv : Child<Stub_ID3D11ShaderResourceView<ID3D11ShaderResourceView>>
     VkDeviceSize bviewOff = ~VkDeviceSize(0);
     VkFormat bfmt = VK_FORMAT_R32_UINT;
     VkDeviceSize bfirst = 0, brange = 0;
+    // r32: the view's format can't be filtered (no SAMPLED_IMAGE_FILTER_LINEAR on this GPU - RGBA32F/R32F
+    // on Adreno, RGBA16/RG16 on some Mali): a linear sampler on it is undefined and came out white
+    // (the "white clothes"); the sampler's nearest twin is bound instead.
+    bool noFilter = false;
     explicit Srv(Device* d) : Child(d) {}
     ~Srv() override;
     void* Find(REFIID riid) override
@@ -589,6 +593,8 @@ struct Sampler : Child<Stub_ID3D11SamplerState<ID3D11SamplerState>>
 {
     D3D11_SAMPLER_DESC desc{};
     VkSampler sampler = VK_NULL_HANDLE;
+    VkSampler nearest = VK_NULL_HANDLE;   // r32: for textures that can't be filtered (null: already nearest)
+    VkSampler For(bool noFilter) const { return noFilter && nearest ? nearest : sampler; }
     explicit Sampler(Device* d) : Child(d) {}
     ~Sampler() override;
     void* Find(REFIID riid) override { return Same(riid, __uuidof(ID3D11SamplerState)) || Same(riid, __uuidof(ID3D11DeviceChild)) ? static_cast<ID3D11SamplerState*>(this) : nullptr; }
@@ -853,6 +859,7 @@ struct Device : Com<Stub_ID3D11Device1<ID3D11Device1>>
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE CreateSamplerState(const D3D11_SAMPLER_DESC* desc, ID3D11SamplerState** out) override;
+    bool Filterable(VkFormat f);
     HRESULT STDMETHODCALLTYPE CreateQuery(const D3D11_QUERY_DESC* desc, ID3D11Query** out) override
     {
         if (!out) return S_FALSE;
@@ -971,7 +978,7 @@ VkBufferView Srv::BufferView()
 static void ForgetTargetView(Device* d, VkImageView v);     // after Context
 Rtv::~Rtv() { ForgetTargetView(device, view); Core* c = &device->core; VkImageView v = view; c->Defer([c, v] { if (v) vkDestroyImageView(c->dev, v, nullptr); }); }
 Dsv::~Dsv() { ForgetTargetView(device, view); Core* c = &device->core; VkImageView v = view; c->Defer([c, v] { if (v) vkDestroyImageView(c->dev, v, nullptr); }); }
-Sampler::~Sampler() { Core* c = &device->core; VkSampler s = sampler; c->Defer([c, s] { if (s) vkDestroySampler(c->dev, s, nullptr); }); }
+Sampler::~Sampler() { Core* c = &device->core; VkSampler s = sampler, n = nearest; c->Defer([c, s, n] { if (s) vkDestroySampler(c->dev, s, nullptr); if (n) vkDestroySampler(c->dev, n, nullptr); }); }
 static void DestroyShader(Core* c, ShaderCode& s)
 {
     VkShaderModule m = s.module;
@@ -1398,7 +1405,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
             else
             {
                 Sampler* s = b.reg < MaxSampler ? static_cast<Sampler*>(st.sampler[b.reg].get()) : nullptr;
-                imgs[i].sampler = s ? s->sampler : dummySampler;
+                imgs[i].sampler = s ? s->For(NoFilter(st, b.reg)) : dummySampler;
                 w.pImageInfo = &imgs[i];
             }
         }
@@ -1406,6 +1413,13 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         return set;
     }
 
+    // r32: does a texture this sampler slot serves (slot s pairs with sampler s & 15) lack linear filtering?
+    static bool NoFilter(const Stage& st, uint32_t reg)
+    {
+        for (uint32_t r = reg; r < MaxSrv; r += 16)
+            if (const Srv* v = static_cast<const Srv*>(st.srv[r].get())) if (v->noFilter) return true;
+        return false;
+    }
     // Signature of what a stage's set would hold (dynamic offsets left out) and those offsets.
     void StageState(const ShaderCode& sc, Stage& st, std::vector<uint64_t>& sig, uint32_t* offsets, uint32_t& count)
     {
@@ -1440,7 +1454,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
             else
             {
                 Sampler* sm = b.reg < MaxSampler ? static_cast<Sampler*>(st.sampler[b.reg].get()) : nullptr;
-                sig.push_back(sm ? uint64_t(reinterpret_cast<uintptr_t>(sm->sampler)) : 3);
+                sig.push_back(sm ? uint64_t(reinterpret_cast<uintptr_t>(sm->For(NoFilter(st, b.reg)))) : 3);
             }
         }
     }
@@ -2947,6 +2961,7 @@ HRESULT Device::CreateShaderResourceView(ID3D11Resource* res, const D3D11_SHADER
         if (d.Format == DXGI_FORMAT_B8G8R8X8_UNORM) ci.components.a = VK_COMPONENT_SWIZZLE_ONE;
         if (d.Format == DXGI_FORMAT_A8_UNORM) ci.components = { VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R };
         if (vkCreateImageView(core.dev, &ci, nullptr, &v->view) != VK_SUCCESS) { v->Release(); return E_INVALIDARG; }
+        v->noFilter = !Filterable(ci.format);
     }
     else
     {
@@ -3023,6 +3038,22 @@ HRESULT Device::CreateDepthStencilView(ID3D11Resource* res, const D3D11_DEPTH_ST
     return S_OK;
 }
 
+// r32: can this GPU filter the format linearly? Asked once per format; the first one that can't is logged.
+bool Device::Filterable(VkFormat f)
+{
+    static std::mutex m;
+    static std::map<VkFormat, bool> known;
+    std::lock_guard l(m);
+    auto it = known.find(f);
+    if (it != known.end()) return it->second;
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(core.phys, f, &fp);
+    const bool ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    known[f] = ok;
+    if (!ok) Log("format %d can't be filtered here: sampled nearest", int(f));
+    return ok;
+}
+
 HRESULT Device::CreateSamplerState(const D3D11_SAMPLER_DESC* desc, ID3D11SamplerState** out)
 {
     if (!desc) return E_INVALIDARG;
@@ -3062,6 +3093,14 @@ HRESULT Device::CreateSamplerState(const D3D11_SAMPLER_DESC* desc, ID3D11Sampler
     ci.borderColor = bc[3] < 0.5f ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
                    : (bc[0] + bc[1] + bc[2]) > 1.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     if (vkCreateSampler(core.dev, &ci, nullptr, &s->sampler) != VK_SUCCESS) { s->Release(); return E_INVALIDARG; }
+    if (ci.magFilter == VK_FILTER_LINEAR || ci.minFilter == VK_FILTER_LINEAR || ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR || ci.anisotropyEnable)
+    {
+        ci.magFilter = ci.minFilter = VK_FILTER_NEAREST;
+        ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        ci.anisotropyEnable = VK_FALSE;
+        ci.maxAnisotropy = 1.0f;
+        if (vkCreateSampler(core.dev, &ci, nullptr, &s->nearest) != VK_SUCCESS) s->nearest = VK_NULL_HANDLE;
+    }
     *out = s;
     return S_OK;
 }
