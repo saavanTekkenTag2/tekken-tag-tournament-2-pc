@@ -53,6 +53,10 @@
 #define DXGI_ERROR_NOT_FOUND ((HRESULT)0x887A0002)
 #endif
 
+// r34: set by the game's renderer for each draw that must not be skipped while its pipeline builds (a texture bake
+// the CPU reads back: costumes). Same thread as the draws.
+extern "C" { int ttt2_native_must_draw = 0; }
+
 namespace ttt2vk {
 
 static std::mutex& RecentMutex() { static std::mutex m; return m; }
@@ -1840,8 +1844,8 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
             const int st = e.state.load();
             if (st == 1) return e.pipe.load();
             if (st == 2) return VK_NULL_HANDLE;
-            if (passHot) { ++skippedDraws; return VK_NULL_HANDLE; }
-            // Still building and this target is new: wait for it (a bake must not lose a draw).
+            if (passHot && !ttt2_native_must_draw) { ++skippedDraws; return VK_NULL_HANDLE; }
+            // Still building and this target is new (or a bake): wait for it (a bake must not lose a draw).
             while (e.state.load() == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
             return e.pipe.load();
         }
@@ -1849,7 +1853,7 @@ struct Context : Com<Stub_ID3D11DeviceContext1<ID3D11DeviceContext1>>
         pipelines.emplace(k, e);
         PipeDesc d;
         Describe(d, layout);
-        if (passHot && AsyncOn())
+        if (passHot && AsyncOn() && !ttt2_native_must_draw)
         {
             ++asyncPipelines;
             {

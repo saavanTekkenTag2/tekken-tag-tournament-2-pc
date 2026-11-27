@@ -360,23 +360,38 @@ public class LauncherActivity extends Activity {
         android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
         final float hdp = Math.min(dm.heightPixels, dm.widthPixels) / dm.density;
         // The block's natural height is about 214 dp; it may use the lower 60% of the screen.
-        final float k = Math.max(0.72f, Math.min(1f, hdp * 0.60f / 214f));
-        final int panelW = 352;
+        // r34: grows on tablets too (up to 1.25x), shrinks on short phones.
+        final float k = Math.max(0.72f, Math.min(1.25f, hdp * 0.60f / 232f));
+        final int panelW = Math.round(352 * Math.max(1f, k));
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
 
-        playItem = new MenuItem("PLAY", this::play, 25 * k, false);
+        // r34: a small "MAIN MENU" header with a red rule above the block.
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        View rule = new View(this);
+        rule.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[] { RED, Color.argb(0, 226, 22, 34) }));
+        head.addView(rule, new LinearLayout.LayoutParams(dp(28), dp(2)));
+        TextView headText = text("MAIN MENU", 9.5f * k, Color.argb(220, 255, 255, 255), semi);
+        headText.setLetterSpacing(0.35f);
+        headText.setPadding(dp(8), 0, 0, 0);
+        head.addView(headText);
+        panel.addView(head, llp(-2, -2, 0));
+
+        playItem = new MenuItem("\u25B6  PLAY", this::play, 25 * k, false);
         isoItem = new MenuItem("SELECT GAME", this::chooseGameSource, 15 * k, false);
         tuItem = new MenuItem("TITLE UPDATE", () -> pick(PICK_TU), 15 * k, false);
         MenuItem options = new MenuItem("OPTIONS", () -> showPage(buildOptions()), 13.5f * k, true);
-        MenuItem updates = new MenuItem("UPDATES", () -> VolvisionUpdateChannel.checkNow(this, VolvisionUpdateChannel.versionName(this)), 13.5f * k, true);
+        // r34: UPDATES opens the game's page on volvisionmods.com (downloads and what's new).
+        MenuItem updates = new MenuItem("UPDATES", () -> VolvisionUpdateChannel.open(this, VolvisionUpdateChannel.STORE_URL), 13.5f * k, true);
         MenuItem credits = new MenuItem("CREDITS", () -> showPage(buildCredits()), 13.5f * k, true);
         menuItems.clear();
         menuItems.add(playItem); menuItems.add(isoItem); menuItems.add(tuItem); menuItems.add(options); menuItems.add(updates); menuItems.add(credits);
         playItem.title.setLetterSpacing(0.14f);
 
-        panel.addView(playItem, llp(dp(panelW), dp(56 * k), 0));
+        panel.addView(playItem, llp(dp(panelW), dp(56 * k), Math.round(6 * k)));
         LinearLayout row1 = new LinearLayout(this);
         row1.setOrientation(LinearLayout.HORIZONTAL);
         row1.addView(isoItem, weighted(dp(50 * k), 0));

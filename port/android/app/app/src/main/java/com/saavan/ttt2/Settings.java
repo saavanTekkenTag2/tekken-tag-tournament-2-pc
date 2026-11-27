@@ -316,7 +316,7 @@ final class Settings {
         SharedPreferences p = c.getSharedPreferences("ttt2", Context.MODE_PRIVATE);
         switch (o.store) {
             case INI: { String v = iniGet(ini, o.section, o.key); return v != null ? v : o.def; }
-            case ENV: return p.getString("env_" + o.key, o.def);
+            case ENV: { Object v = p.getAll().get("env_" + o.key); return v == null ? o.def : String.valueOf(v); }
             default: {
                 // Older builds kept these as booleans / ints.
                 Object v = p.getAll().get(o.key);
@@ -346,15 +346,20 @@ final class Settings {
         List<String> a = new ArrayList<>();
         for (Opt o : ALL) {
             if (o.store != ENV) continue;
-            String v = locked(c, o) ? o.def : p.getString("env_" + o.key, o.def);
+            Object raw = locked(c, o) ? o.def : p.getAll().get("env_" + o.key);
+            String v = raw == null ? o.def : String.valueOf(raw);
             if (v == null || v.isEmpty()) continue;
             a.add("--set"); a.add(o.key + "=" + v);
         }
         // r30: Graphics fix - every speed shortcut with a correctness risk off (on top of the locked values).
-        if ("1".equals(p.getString("gfx_compat", "0"))) {
+        // r34: gfx_compat is saved as a boolean (an ON/OFF PREF): getString on it threw ClassCastException in the
+        // game's process, so with Graphics fix ON the game closed at once (vivo / Lenovo logs).
+        final Object gfx = p.getAll().get("gfx_compat");
+        final boolean gfxOn = gfx instanceof Boolean ? (Boolean) gfx : "1".equals(String.valueOf(gfx));
+        if (gfxOn) {
             for (String kv : new String[] { "TTT2_TEX_MEMO=0", "TTT2_FAST_UNTILE=0", "TTT2_LAZY_READBACK=0", "TTT2_NATIVE_FULL_BARRIERS=1",
                                             "TTT2_NATIVE_ONEOFF_WAIT=1", "TTT2_NATIVE_DECODE_BC=1", "TTT2_NATIVE_NO_SPV_CACHE=1",
-                                            "TTT2_NATIVE_ASYNC=0", "TTT2_GFX_COMPAT=1" }) {
+                                            "TTT2_NATIVE_ASYNC=0", "TTT2_TEX_MEMO2=0", "TTT2_GFX_COMPAT=1" }) {
                 a.add("--set"); a.add(kv);
             }
         }

@@ -78,6 +78,10 @@ void GpuTakeFlipStats(uint64_t& entries, uint64_t& late, uint64_t& paced);      
 bool GpuLateFlipAbOn();
 void GpuLateFlipAbToggle();
 bool LateFlipOn();
+#ifdef __ANDROID__
+extern "C" __attribute__((weak)) int ttt2_native_must_draw;   // ttt2vk.cpp (r34)
+#endif
+
 namespace frame_overlap {
 void TakeStats(uint64_t& kicks, uint64_t& overlapped);
 std::string TakeGuardStats(double presents);
@@ -1517,6 +1521,13 @@ public:
         D3D11_VIEWPORT vp{ 0, 0, float(st.pitch * st.sampX) * sc, float(SurfaceH) * sc, 0, 1 };
         D3D11_RECT scissor{ LONG(Px(std::max(st.scX0, 0) * int(st.sampX), sc)), LONG(Px(std::max(st.scY0, 0) * int(st.sampY), sc)),
                             LONG(Px(double(x1), sc)), LONG(Px(double(y1), sc)) };
+#ifdef __ANDROID__
+        // r34: the native renderer may skip a draw whose pipeline is still being built in the background, on targets
+        // drawn into frame after frame. A costume bake (the CPU reads it back once: 1024x1024 / 512x512, square) must
+        // never lose a draw - a skipped colour layer left the bake white: the white clothes on phones.
+        if (&ttt2_native_must_draw)
+            ttt2_native_must_draw = st.writeMask && (native || (needW == needH && needW >= 128 && needW <= 1024)) ? 1 : 0;
+#endif
         ApplyPipe(rtv, dsv, blendState, factor, depthState, stencilRef, vp, scissor, RasterState(st), ps, srvs, samplers, textureSlots);
         dOm.Stop();
         if (FlashMax())     // TEST ONLY (p_diag31): the draw and what each slot samples
